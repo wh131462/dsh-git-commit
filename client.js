@@ -281,18 +281,23 @@ window.__ModuleLoader__.load({
       '@media (prefers-reduced-motion: reduce){.dsh-sc-btn{transition:none!important;}}',
     ].join('\n');
 
-    /** A commit node on the current branch. */
+    /** A commit node on the current branch, with a sparkle for the smart naming. */
     function CommitIcon() {
       return h(
         'svg',
         { viewBox: '0 0 16 16', width: 13, height: 13, fill: 'none', 'aria-hidden': 'true' },
         h('path', {
-          d: 'M8 2.2v3.1M8 10.7v3.1',
+          d: 'M6.2 1.9v2.8M6.2 11.3v2.8',
           stroke: 'currentColor',
-          strokeWidth: 1.6,
+          strokeWidth: 1.7,
           strokeLinecap: 'round',
         }),
-        h('circle', { cx: 8, cy: 8, r: 2.6, stroke: 'currentColor', strokeWidth: 1.6 }),
+        h('circle', { cx: 6.2, cy: 8, r: 2.55, stroke: 'currentColor', strokeWidth: 1.7 }),
+        h('circle', { cx: 6.2, cy: 8, r: 0.95, fill: 'currentColor' }),
+        h('path', {
+          d: 'M12.4 1.9c.22 2.3.8 2.88 3.1 3.1-2.3.22-2.88.8-3.1 3.1-.22-2.3-.8-2.88-3.1-3.1 2.3-.22 2.88-.8 3.1-3.1Z',
+          fill: 'currentColor',
+        }),
       );
     }
 
