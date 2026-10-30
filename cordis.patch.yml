@@ -1,0 +1,20 @@
+# Smart commit: one Host row plus its Client half. The profile's own patch layer
+# may repeat this id to override any field below.
+- insert:
+    - id: smart-commit
+      name: '@eternalheart/dsh-git-commit'
+      config:
+        # Git executable; empty lets the plugin find one for a Finder-launched app.
+        gitPath: ''
+        # Per-invocation git deadline.
+        timeoutMs: 20000
+        # Above this many type+scope groups, whole types are consolidated.
+        maxGroups: 6
+        # One model call names every group, using this Session's current route.
+        useModel: true
+        modelTimeoutMs: 60000
+        # Diff characters sent to the model (bounded prompt).
+        maxInputChars: 24000
+        maxTokens: 2000
+        # Extra targeted model rounds for headers that failed validation.
+        repairRounds: 1

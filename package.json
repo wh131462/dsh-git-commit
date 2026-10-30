@@ -1,0 +1,64 @@
+{
+  "name": "@eternalheart/dsh-git-commit",
+  "version": "2.0.0",
+  "type": "module",
+  "description": "One-click git commit for DeepSeek Harness: groups the working tree by Angular type and scope, names every group with the session's current model, then commits it — no chat message, no agent turn.",
+  "license": "MIT",
+  "author": "EternalHeart <hao131462@qq.com>",
+  "homepage": "https://github.com/wh131462/dsh-git-commit#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wh131462/dsh-git-commit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wh131462/dsh-git-commit/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "git",
+    "commit",
+    "smart-commit",
+    "conventional-commits",
+    "commitlint",
+    "angular"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/host.test.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}
