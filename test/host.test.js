@@ -4,21 +4,25 @@ import { execFile } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { promisify } from 'node:util';
 
 import {
   analyzeRepo,
   apply,
+  assertPlanMatches,
   buildHeader,
   buildModelInput,
   classify,
   commitPlan,
+  createApi,
+  createRouteHandler,
   extractMessages,
   groupEntries,
   isSensitive,
   normalizeMessage,
   parseStatus,
-  renderPlan,
+  publicPlan,
   resolveConfig,
   scopeOf,
   validateMessage,
@@ -26,6 +30,7 @@ import {
 
 const exec = promisify(execFile);
 const GIT = 'git';
+const SESSION = 'session-1';
 
 /**
  * Create a temporary repository with one initial commit.
@@ -67,39 +72,47 @@ async function populate(dir) {
 }
 
 /**
- * Mount the plugin on a stub Host context.
- * @param config - row config.
+ * A stub Host context with the three services the API reads.
  * @param cwd - Session working directory.
- * @returns the registered commands and the fake agent.
+ * @param options - session id, LLM stub, admission result.
+ * @returns a fake `ctx`.
  */
-function harness(config, cwd, services = {}) {
-  const commands = [];
-  const ctx = {
-    get: (name) => services[name],
-    inject: (_names, callback) => callback(ctx),
-    effect: (callback) => {
-      callback();
-      return () => {};
-    },
-    commands: {
-      register: (definition) => {
-        commands.push(definition);
-        return () => {};
+function makeCtx(cwd, { sessionId = SESSION, llm = autoLlm(), admit } = {}) {
+  const sessions = new Map([
+    [
+      sessionId,
+      {
+        header: { cwd },
+        requestHeader: () => ({
+          config: { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' },
+        }),
       },
+    ],
+  ]);
+  return {
+    get(name) {
+      if (name === 'sessions') return { get: (id) => sessions.get(id) };
+      if (name === 'workingDirectory') return { get: (session) => session.header.cwd };
+      if (name === 'llm') return llm;
+      if (name === 'connection') {
+        return { admit: admit ?? (() => ({ peer: { principal: { kind: 'owner' } } })) };
+      }
+      return undefined;
     },
+    logger: { warn() {} },
   };
-  if (services.llm === undefined) services.llm = autoLlm();
-  const agent = {
-    id: 'session-1',
-    session: {
-      header: { cwd },
-      requestHeader: () => ({
-        config: { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' },
-      }),
-    },
-  };
-  apply(ctx, config);
-  return { commands, agent };
+}
+
+/**
+ * Build the API against a stub context and the real git binary.
+ * @param cwd - Session working directory.
+ * @param options - extra config, session id, and LLM stub.
+ * @returns `{ api, ctx, config }`.
+ */
+function makeApi(cwd, { config, ...rest } = {}) {
+  const resolved = resolveConfig({ gitPath: GIT, ...config });
+  const ctx = makeCtx(cwd, rest);
+  return { api: createApi(ctx, resolved), ctx, config: resolved };
 }
 
 /**
@@ -149,6 +162,38 @@ function autoLlm() {
       );
       yield { type: 'text-delta', text: JSON.stringify({ messages }) };
       yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  };
+}
+
+/** One fake request stream for the route handler. */
+function fakeRequest({ method = 'POST', url = '/dsh-git-commit/analyze', body = {}, contentType = 'application/json' }) {
+  const request = Readable.from([Buffer.from(JSON.stringify(body))]);
+  request.method = method;
+  request.url = url;
+  request.headers = contentType === null ? {} : { 'content-type': contentType };
+  return request;
+}
+
+/** One fake response that records status, headers, and body. */
+function fakeResponse() {
+  return {
+    status: 0,
+    headers: null,
+    body: '',
+    writableEnded: false,
+    listeners: new Map(),
+    writeHead(status, headers) {
+      this.status = status;
+      this.headers = headers;
+    },
+    end(text = '') {
+      this.body = text;
+      this.writableEnded = true;
+    },
+    on(event, listener) {
+      this.listeners.set(event, listener);
+      return this;
     },
   };
 }
@@ -210,7 +255,6 @@ test('consolidates whole types past maxGroups without mixing or losing files', (
     { code: ' M', path: 'b/four.ts' },
   ];
   const { groups } = groupEntries(entries, 3);
-  // feat(a) + feat(b) merge, leaving four type-pure groups.
   assert.equal(groups.length, 4);
   assert.equal(new Set(groups.map((group) => group.type)).size, groups.length);
   const covered = groups.flatMap((group) => group.files).sort();
@@ -233,7 +277,7 @@ test('validates the Angular message rules', () => {
   assert.equal(validateMessage(buildHeader('refactor', 'backend-coal-mind-agent', '更新 一个非常长的文件名.ts')), null);
 });
 
-test('analyzes a real working tree and renders the plan', async () => {
+test('analyzes a real working tree into a wire plan', async () => {
   const repo = await createRepo();
   try {
     await populate(repo.dir);
@@ -250,16 +294,14 @@ test('analyzes a real working tree and renders the plan', async () => {
     assert.equal(analysis.plan.groups.length, 5);
     assert.deepEqual(analysis.plan.skipped, ['.env']);
 
-    const text = renderPlan(analysis.plan);
-    assert.match(text, /^待确认 5 组 \/ 6 个文件 · main/m);
-    assert.match(text, /跳过 1 个敏感文件：\.env/);
-
-    const parsed = text
-      .split('\n')
-      .map((line) => /^(\d+)\.\s+(.+?)\s+·\s+(\d+)\s+个文件\s*$/u.exec(line))
-      .filter(Boolean);
-    assert.equal(parsed.length, 5);
-    for (const [, , message] of parsed) assert.equal(validateMessage(message), null);
+    const plan = publicPlan(analysis.plan);
+    assert.equal(plan.vcs, 'git');
+    assert.equal(plan.groups.length, 5);
+    for (const group of plan.groups) {
+      assert.equal(validateMessage(group.message), null, group.message);
+      assert.equal(group.files.length > 0, true);
+    }
+    assert.equal('cwd' in plan, false);
   } finally {
     await repo.cleanup();
   }
@@ -289,7 +331,6 @@ test('commits every group without touching staged content or secrets', async () 
     assert.ok(subjects.includes('docs: 补充 README 说明'));
     for (const message of messages) assert.ok(subjects.includes(message), message);
 
-    // The sensitive file stays untracked, everything else is committed.
     const status = await exec(GIT, ['status', '--porcelain'], { cwd: repo.dir });
     assert.equal(status.stdout.trim(), '?? .env');
     const tracked = await exec(GIT, ['ls-files', '--', '.env'], { cwd: repo.dir });
@@ -353,129 +394,195 @@ test('reports a directory that is not a repository', async () => {
   }
 });
 
-test('handler stages then commits through one command name', async () => {
+test('api.analyze returns groups with empty messages and a model label', async () => {
   const repo = await createRepo();
   try {
     await populate(repo.dir);
-    const { commands, agent } = harness({ gitPath: GIT }, repo.dir);
-    assert.equal(commands.length, 1);
-    assert.equal(commands[0].name, 'smart-commit');
-    const handler = commands[0].handler;
-
-    const staged = await handler({ agent, rawInput: '', attachments: [] });
-    assert.equal(staged.kind, 'success');
-    assert.match(staged.text, /^待确认 5 组/);
-
-    const committed = await handler({ agent, rawInput: 'commit', attachments: [] });
-    assert.equal(committed.kind, 'success', committed.text);
-    assert.match(committed.text, /提交完成：5 组/);
-
-    const again = await handler({ agent, rawInput: 'commit', attachments: [] });
-    assert.equal(again.kind, 'error');
-    assert.match(again.text, /没有待提交的分组/);
+    const { api } = makeApi(repo.dir);
+    const result = await api.analyze({ sessionId: SESSION });
+    assert.equal(result.plan.groups.length, 5);
+    assert.equal(result.useModel, true);
+    assert.equal(result.model, 'deepseek-official/deepseek-flash');
+    for (const group of result.plan.groups) {
+      assert.equal(group.message, '');
+      assert.notEqual(group.suggestion, '');
+    }
+    assert.deepEqual(result.plan.skipped, ['.env']);
   } finally {
     await repo.cleanup();
   }
 });
 
-test('handler applies edited messages sent as JSON', async () => {
+test('api.analyze reports a clean tree as an informational failure', async () => {
   const repo = await createRepo();
   try {
-    await populate(repo.dir);
-    const { commands, agent } = harness({ gitPath: GIT }, repo.dir);
-    const handler = commands[0].handler;
-    const staged = await handler({ agent, rawInput: '', attachments: [] });
-    assert.equal(staged.kind, 'success');
-    const parsed = staged.text
-      .split('\n')
-      .map((line) => /^(\d+)\.\s+(.+?)\s+·\s+(\d+)\s+个文件\s*$/u.exec(line))
-      .filter(Boolean);
-    const messages = parsed.map(([, , message]) => message);
-    messages[0] = 'docs: 修改 README 说明';
-    const committed = await handler({
-      agent,
-      rawInput: `commit ${JSON.stringify({ messages })}`,
-      attachments: [],
-    });
-    assert.equal(committed.kind, 'success', committed.text);
-    const { stdout } = await exec(GIT, ['log', '--format=%s', '-1'], { cwd: repo.dir });
-    assert.equal(stdout.trim(), messages[messages.length - 1]);
-    const all = await exec(GIT, ['log', '--format=%s', '-6'], { cwd: repo.dir });
-    assert.ok(all.stdout.split('\n').includes('docs: 修改 README 说明'));
+    const { api } = makeApi(repo.dir);
+    await assert.rejects(
+      api.analyze({ sessionId: SESSION }),
+      (error) => error.code === 'clean' && /工作区干净/.test(error.message),
+    );
   } finally {
     await repo.cleanup();
   }
 });
 
-test('handler decodes a base64 message payload from the button', async () => {
+test('api.analyze refuses an unknown session', async () => {
   const repo = await createRepo();
   try {
-    await populate(repo.dir);
-    const { commands, agent } = harness({ gitPath: GIT }, repo.dir);
-    const handler = commands[0].handler;
-    const staged = await handler({ agent, rawInput: '', attachments: [] });
-    assert.equal(staged.kind, 'success');
-    const parsed = staged.text
-      .split('\n')
-      .map((line) => /^(\d+)\.\s+(.+?)\s+·\s+(\d+)\s+个文件\s*$/u.exec(line))
-      .filter(Boolean);
-    const messages = parsed.map(([, , message]) => message);
-    messages[1] = 'docs: 补充 README 使用说明';
-    const payload = Buffer.from(JSON.stringify({ messages }), 'utf8').toString('base64');
-    const committed = await handler({ agent, rawInput: `commit ${payload}`, attachments: [] });
-    assert.equal(committed.kind, 'success', committed.text);
-    const { stdout } = await exec(GIT, ['log', '--format=%s', '-6'], { cwd: repo.dir });
-    assert.ok(stdout.split('\n').includes('docs: 补充 README 使用说明'));
+    const { api } = makeApi(repo.dir);
+    await assert.rejects(
+      api.analyze({ sessionId: 'missing' }),
+      (error) => error.code === 'no-session',
+    );
   } finally {
     await repo.cleanup();
   }
 });
 
-test('model messages replace the heuristic ones in one call', async () => {
+test('api.name fills every group in one model call', async () => {
   const repo = await createRepo();
   try {
     await populate(repo.dir);
     const generated = Array.from({ length: 5 }, (_, index) => `refactor(model): 模型生成 message ${index + 1}`);
-    const llm = fakeLlm(JSON.stringify({ messages: generated }));
-    const { commands, agent } = harness({ gitPath: GIT }, repo.dir, { llm });
-    const staged = await commands[0].handler({ agent, rawInput: '', attachments: [] });
-    assert.equal(staged.kind, 'success', staged.text);
-    assert.match(staged.text, /deepseek-official\/deepseek-flash 生成了全部 5 条 message/);
-    for (const message of generated) assert.ok(staged.text.includes(message), message);
-    assert.doesNotMatch(staged.text, /docs: 更新 README\.md/);
+    const { api } = makeApi(repo.dir, { llm: fakeLlm(JSON.stringify({ messages: generated })) });
+    const named = await api.name({ sessionId: SESSION });
+    assert.deepEqual(named.messages, generated);
+    assert.equal(named.failures.length, 0);
+    assert.match(named.note, /生成了全部 5 条 message/);
+    assert.match(named.plan.groups[0].message, /模型生成/);
   } finally {
     await repo.cleanup();
   }
 });
 
-test('a failed model call aborts instead of committing heuristic messages', async () => {
+test('api.commit writes the confirmed messages', async () => {
   const repo = await createRepo();
   try {
     await populate(repo.dir);
-    const { commands, agent } = harness({ gitPath: GIT }, repo.dir, { llm: fakeLlm('', { fail: true }) });
-    const staged = await commands[0].handler({ agent, rawInput: '', attachments: [] });
-    assert.equal(staged.kind, 'error', staged.text);
-    assert.match(staged.text, /模型总结不可用（DeepSeek Messages transport failed）/);
-    assert.match(staged.text, /没有生成分组/);
+    const { api } = makeApi(repo.dir);
+    const analyzed = await api.analyze({ sessionId: SESSION });
+    const messages = analyzed.plan.groups.map((group) => `refactor(model): 提交 ${group.type}`);
+    messages[0] = 'docs: 补充 README 说明';
+    const outcome = await api.commit({
+      sessionId: SESSION,
+      plan: analyzed.plan,
+      messages,
+      unstage: false,
+    });
+    assert.equal(outcome.ok, true, outcome.text);
+    assert.match(outcome.text, /提交完成：5 组/);
+    const log = await exec(GIT, ['log', '--format=%s', '-6'], { cwd: repo.dir });
+    assert.ok(log.stdout.split('\n').includes('docs: 补充 README 说明'));
   } finally {
     await repo.cleanup();
   }
 });
 
-test('model output that is not the agreed JSON aborts the run', async () => {
+test('api.commit rejects an invalid message before touching the index', async () => {
   const repo = await createRepo();
   try {
     await populate(repo.dir);
-    const { commands, agent } = harness({ gitPath: GIT }, repo.dir, { llm: fakeLlm('对不起，我不能输出 JSON') });
-    const staged = await commands[0].handler({ agent, rawInput: '', attachments: [] });
-    assert.equal(staged.kind, 'error', staged.text);
-    assert.match(staged.text, /模型输出不是约定的 JSON/);
+    const { api } = makeApi(repo.dir);
+    const analyzed = await api.analyze({ sessionId: SESSION });
+    const messages = analyzed.plan.groups.map((group) => group.suggestion);
+    messages[0] = 'chore: 杂务';
+    await assert.rejects(
+      api.commit({ sessionId: SESSION, plan: analyzed.plan, messages, unstage: false }),
+      (error) =>
+        error.code === 'invalid-message' &&
+        /未通过校验/.test(error.message) &&
+        error.details.groups[0].index === 0,
+    );
+    const log = await exec(GIT, ['log', '--format=%s'], { cwd: repo.dir });
+    assert.equal(log.stdout.trim(), 'docs: 初始化 README');
+    const index = await exec(GIT, ['diff', '--cached', '--name-only'], { cwd: repo.dir });
+    assert.equal(index.stdout.trim(), '');
   } finally {
     await repo.cleanup();
   }
 });
 
-test('an invalid header is repaired by one targeted model round', async () => {
+test('api.commit refuses a plan whose file groups changed', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    const { api } = makeApi(repo.dir);
+    const analyzed = await api.analyze({ sessionId: SESSION });
+    await writeFile(join(repo.dir, 'src', 'late.js'), 'export const late = 1;\n', 'utf8');
+    await assert.rejects(
+      api.commit({
+        sessionId: SESSION,
+        plan: analyzed.plan,
+        messages: analyzed.plan.groups.map((group) => group.suggestion),
+        unstage: false,
+      }),
+      (error) => error.code === 'stale' && /重新分析/.test(error.message),
+    );
+    const log = await exec(GIT, ['log', '--format=%s'], { cwd: repo.dir });
+    assert.equal(log.stdout.trim(), 'docs: 初始化 README');
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('api.commit asks for the unstage checkbox, then releases exactly those paths', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    await exec(GIT, ['add', '--', 'README.md'], { cwd: repo.dir });
+    const { api } = makeApi(repo.dir);
+    const analyzed = await api.analyze({ sessionId: SESSION });
+    assert.deepEqual(analyzed.plan.staged, ['README.md']);
+    const messages = analyzed.plan.groups.map((group) => group.suggestion);
+    await assert.rejects(
+      api.commit({ sessionId: SESSION, plan: analyzed.plan, messages, unstage: false }),
+      (error) => error.code === 'staged' && /先取消暂存/.test(error.message),
+    );
+    const outcome = await api.commit({
+      sessionId: SESSION,
+      plan: analyzed.plan,
+      messages,
+      unstage: true,
+    });
+    assert.equal(outcome.ok, true, outcome.text);
+    const index = await exec(GIT, ['diff', '--cached', '--name-only'], { cwd: repo.dir });
+    assert.equal(index.stdout.trim(), '');
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('api.name reports a model transport failure without touching git', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    const { api } = makeApi(repo.dir, { llm: fakeLlm('', { fail: true }) });
+    await assert.rejects(
+      api.name({ sessionId: SESSION }),
+      (error) => error.code === 'model-failed' && /DeepSeek Messages transport failed/.test(error.message),
+    );
+    const log = await exec(GIT, ['log', '--format=%s'], { cwd: repo.dir });
+    assert.equal(log.stdout.trim(), 'docs: 初始化 README');
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('api.name rejects a non-JSON model reply', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    const { api } = makeApi(repo.dir, { llm: fakeLlm('对不起，我不能输出 JSON') });
+    await assert.rejects(
+      api.name({ sessionId: SESSION }),
+      (error) => error.code === 'model-failed' && /约定的 JSON/.test(error.message),
+    );
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('api.name repairs invalid headers in one targeted round', async () => {
   const repo = await createRepo();
   try {
     await populate(repo.dir);
@@ -489,19 +596,18 @@ test('an invalid header is repaired by one targeted model round', async () => {
       ],
     });
     const repaired = JSON.stringify({ messages: ['ci: 调整流水线', 'feat(agent): 新增文档生成能力'] });
-    const { commands, agent } = harness({ gitPath: GIT }, repo.dir, { llm: fakeLlm([first, repaired]) });
-    const staged = await commands[0].handler({ agent, rawInput: '', attachments: [] });
-    assert.equal(staged.kind, 'success', staged.text);
-    assert.match(staged.text, /生成了全部 5 条 message/);
-    assert.ok(staged.text.includes('ci: 调整流水线'));
-    assert.ok(staged.text.includes('feat(agent): 新增文档生成能力'));
-    assert.doesNotMatch(staged.text, /待补充 message/);
+    const { api } = makeApi(repo.dir, { llm: fakeLlm([first, repaired]) });
+    const named = await api.name({ sessionId: SESSION });
+    assert.equal(named.failures.length, 0);
+    assert.match(named.note, /生成了全部 5 条 message/);
+    assert.ok(named.messages.includes('ci: 调整流水线'));
+    assert.ok(named.messages.includes('feat(agent): 新增文档生成能力'));
   } finally {
     await repo.cleanup();
   }
 });
 
-test('a header still invalid after repair blocks its group instead of guessing', async () => {
+test('api.name leaves a still-invalid group empty instead of guessing', async () => {
   const repo = await createRepo();
   try {
     await populate(repo.dir);
@@ -515,13 +621,137 @@ test('a header still invalid after repair blocks its group instead of guessing',
       ],
     });
     const repaired = JSON.stringify({ messages: ['chore: 还是杂务'] });
-    const { commands, agent } = harness({ gitPath: GIT }, repo.dir, { llm: fakeLlm([first, repaired]) });
-    const staged = await commands[0].handler({ agent, rawInput: '', attachments: [] });
-    assert.equal(staged.kind, 'success', staged.text);
-    assert.match(staged.text, /1 组还没有可用的模型 message/);
-    assert.match(staged.text, /第 1 组：type 不在枚举内：chore/);
-    assert.match(staged.text, /（待补充 message）/);
-    assert.doesNotMatch(staged.text, /refactor: 调整 1 个文件/);
+    const { api } = makeApi(repo.dir, { llm: fakeLlm([first, repaired]) });
+    const named = await api.name({ sessionId: SESSION });
+    assert.equal(named.failures.length, 1);
+    assert.equal(named.messages[0], '');
+    assert.match(named.note, /1 组还没有可用的模型 message/);
+    assert.match(named.note, /chore/);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('assertPlanMatches accepts edited messages and rejects a changed grouping', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, maxGroups: 6, timeoutMs: 20000 });
+    const plan = publicPlan(analysis.plan);
+    const edited = { ...plan, groups: plan.groups.map((group) => ({ ...group, message: 'docs: 改过' })) };
+    assert.doesNotThrow(() => assertPlanMatches(edited, analysis.plan));
+    const moved = {
+      ...plan,
+      groups: plan.groups.map((group, index) =>
+        index === 0 ? { ...group, files: [...group.files, 'src/extra.js'] } : group,
+      ),
+    };
+    assert.throws(() => assertPlanMatches(moved, analysis.plan), (error) => error.code === 'stale');
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('http route rejects non-POST, unauthenticated, unknown, and non-JSON requests', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    const { api } = makeApi(repo.dir);
+    const route = createRouteHandler(makeCtx(repo.dir), api);
+
+    let res = fakeResponse();
+    await route(fakeRequest({ method: 'GET' }), res);
+    assert.equal(res.status, 405);
+
+    res = fakeResponse();
+    await route(fakeRequest({ body: { sessionId: SESSION } }), res);
+    assert.equal(res.status, 200);
+    assert.equal(JSON.parse(res.body).ok, true);
+
+    const denied = createRouteHandler(
+      makeCtx(repo.dir, { admit: () => ({ rejection: 401 }) }),
+      api,
+    );
+    res = fakeResponse();
+    await denied(fakeRequest({}), res);
+    assert.equal(res.status, 401);
+
+    res = fakeResponse();
+    await route(fakeRequest({ url: '/dsh-git-commit/nope' }), res);
+    assert.equal(res.status, 404);
+
+    res = fakeResponse();
+    await route(fakeRequest({ contentType: 'text/plain' }), res);
+    assert.equal(res.status, 415);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('http route returns the analyze envelope for an authenticated owner', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    const ctx = makeCtx(repo.dir);
+    const api = createApi(ctx, resolveConfig({ gitPath: GIT }));
+    const route = createRouteHandler(ctx, api);
+    const res = fakeResponse();
+    await route(fakeRequest({ body: { sessionId: SESSION } }), res);
+    assert.equal(res.status, 200);
+    const body = JSON.parse(res.body);
+    assert.equal(body.ok, true);
+    assert.equal(body.value.plan.groups.length, 5);
+    assert.equal(body.value.model, 'deepseek-official/deepseek-flash');
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('apply registers one authenticated prefix route on the web server', () => {
+  const routes = [];
+  const webServer = {
+    register(route) {
+      routes.push(route);
+      return () => {};
+    },
+  };
+  const connection = { admit: () => ({ peer: { principal: { kind: 'owner' } } }) };
+  const registered = {
+    webServer,
+    connection,
+    get(name) {
+      if (name === 'webServer') return webServer;
+      if (name === 'connection') return connection;
+      return undefined;
+    },
+    inject(_names, callback) {
+      callback(registered);
+    },
+    effect(callback) {
+      return callback();
+    },
+    logger: { warn() {} },
+  };
+  apply(registered, { gitPath: GIT });
+  assert.equal(routes.length, 1);
+  assert.equal(routes[0].kind, 'prefix');
+  assert.equal(routes[0].path, '/dsh-git-commit');
+  assert.equal(typeof routes[0].handler, 'function');
+});
+
+test('http route serializes a business failure as a 200 error envelope', async () => {
+  const repo = await createRepo();
+  try {
+    const ctx = makeCtx(repo.dir);
+    const api = createApi(ctx, resolveConfig({ gitPath: GIT }));
+    const route = createRouteHandler(ctx, api);
+    const res = fakeResponse();
+    await route(fakeRequest({ body: { sessionId: SESSION } }), res);
+    assert.equal(res.status, 200);
+    const body = JSON.parse(res.body);
+    assert.equal(body.ok, false);
+    assert.equal(body.error.code, 'clean');
+    assert.match(body.error.message, /工作区干净/);
   } finally {
     await repo.cleanup();
   }
@@ -556,45 +786,6 @@ test('extractMessages finds the JSON object in prose and fences', () => {
   assert.deepEqual(extractMessages('好的：{"messages":["a: b","c: d"]} 完成'), ['a: b', 'c: d']);
   assert.equal(extractMessages('no json here'), null);
   assert.equal(extractMessages('{"messages":[1,2]}'), null);
-});
-
-test('handler refuses a pre-existing index, then releases it on request', async () => {
-  const repo = await createRepo();
-  try {
-    await populate(repo.dir);
-    await exec(GIT, ['add', '--', 'README.md'], { cwd: repo.dir });
-    const { commands, agent } = harness({ gitPath: GIT }, repo.dir);
-    const handler = commands[0].handler;
-
-    const staged = await handler({ agent, rawInput: '', attachments: [] });
-    assert.equal(staged.kind, 'success', staged.text);
-    assert.match(staged.text, /暂存区已有 1 个文件/);
-    assert.match(staged.text, /^\s+! README\.md$/m);
-
-    const refused = await handler({ agent, rawInput: 'commit', attachments: [] });
-    assert.equal(refused.kind, 'error');
-    assert.match(refused.text, /取消暂存/);
-
-    const release = Buffer.from(
-      JSON.stringify({
-        messages: staged.text
-          .split('\n')
-          .map((line) => /^(\d+)\.\s+(.+?)\s+·\s+(\d+)\s+个文件\s*$/u.exec(line))
-          .filter(Boolean)
-          .map(([, , message]) => message),
-        unstage: true,
-      }),
-      'utf8',
-    ).toString('base64');
-    const committed = await handler({ agent, rawInput: `commit ${release}`, attachments: [] });
-    assert.equal(committed.kind, 'success', committed.text);
-    const log = await exec(GIT, ['log', '--format=%s', '-6'], { cwd: repo.dir });
-    assert.ok(log.stdout.split('\n').some((subject) => subject.startsWith('docs:')));
-    const index = await exec(GIT, ['diff', '--cached', '--name-only'], { cwd: repo.dir });
-    assert.equal(index.stdout.trim(), '');
-  } finally {
-    await repo.cleanup();
-  }
 });
 
 test('a failing commit puts this run staging back and keeps the work', async () => {

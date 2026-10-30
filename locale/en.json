@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Smart Commit",
-    "description": "Adds a Commit control to the composer. The plugin probes the repository, groups the working tree by Angular type and scope, names every group with one call to the session's current model, and runs git itself once you confirm."
+    "description": "Adds a Commit control to the composer. The plugin detects Git or SVN, groups the working tree by Angular type and scope, names every group with one call to the session's current model, and runs the VCS itself once you confirm."
   }
 }

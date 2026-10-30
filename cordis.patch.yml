@@ -4,9 +4,13 @@
     - id: smart-commit
       name: '@eternalheart/dsh-git-commit'
       config:
+        # auto prefers Git, then falls back to SVN; git / svn pin one adapter.
+        vcs: auto
         # Git executable; empty lets the plugin find one for a Finder-launched app.
         gitPath: ''
-        # Per-invocation git deadline.
+        # SVN executable; empty probes /usr/bin/svn, Homebrew, /usr/local/bin/svn.
+        svnPath: ''
+        # Per-invocation git/svn deadline.
         timeoutMs: 20000
         # Above this many type+scope groups, whole types are consolidated.
         maxGroups: 6

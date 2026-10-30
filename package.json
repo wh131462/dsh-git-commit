@@ -1,8 +1,8 @@
 {
   "name": "@eternalheart/dsh-git-commit",
-  "version": "2.0.1",
+  "version": "3.0.0",
   "type": "module",
-  "description": "One-click git commit for DeepSeek Harness: groups the working tree by Angular type and scope, names every group with the session's current model, then commits it — no chat message, no agent turn.",
+  "description": "One-click Git or SVN commit for DeepSeek Harness: groups the working tree by Angular type and scope, names every group with the session's current model, and commits over an authenticated JSON channel — no chat message, no agent turn, no command node.",
   "license": "MIT",
   "author": "EternalHeart <hao131462@qq.com>",
   "homepage": "https://github.com/wh131462/dsh-git-commit#readme",
@@ -18,6 +18,8 @@
     "dsh-plugin",
     "deepseek-harness",
     "git",
+    "svn",
+    "subversion",
     "commit",
     "smart-commit",
     "conventional-commits",
@@ -39,6 +41,7 @@
   },
   "files": [
     "index.js",
+    "svn.js",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
@@ -48,7 +51,12 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/host.test.js"
+    "test": "node --test test/*.test.js",
+    "prepublishOnly": "npm test",
+    "pack": "npm pack",
+    "publish:npm": "npm publish --access public",
+    "release": "npm run pack && npm run publish:npm",
+    "release:notes": "node scripts/release-notes.mjs"
   },
   "dsh": {
     "bundle": {

@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "智能提交",
-    "description": "在输入框加入「提交」按钮：插件自己探测仓库、按 Angular 规范分组，再用当前会话的模型一次生成全部 commit message，确认后直接执行 git 提交。"
+    "description": "在输入框旁添加提交按钮。插件自动识别 Git 或 SVN，按 Angular 的 type 与 scope 分组，用当前会话的模型为每组生成 message，确认后由插件自己执行提交。"
   }
 }

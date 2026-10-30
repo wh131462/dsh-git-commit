@@ -1,0 +1,100 @@
+name: Release
+
+# A push to main whose head commit subject is exactly `feat: vX.Y.Z` cuts the
+# release: it pins that version, runs the tests, and creates a GitHub release
+# tagged `vX.Y.Z` with the npm tarball attached.
+#
+# Publishing to npm is done locally with `npm run release`, so this workflow
+# needs no NPM_TOKEN and only uses the built-in GITHUB_TOKEN.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write   # create the tag and the release
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags and full history are needed for the notes
+
+      - name: Detect release commit
+        id: detect
+        shell: bash
+        run: |
+          subject="$(git log -1 --pretty=%s)"
+          if [[ "$subject" =~ ^feat:\ v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            version="${BASH_REMATCH[1]}"
+            echo "matched=true" >> "$GITHUB_OUTPUT"
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+            echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+            echo "Releasing v${version}"
+          else
+            echo "matched=false" >> "$GITHUB_OUTPUT"
+            echo "Head commit is not a release commit: ${subject}"
+            echo "Expected subject: feat: vX.Y.Z — skipping."
+          fi
+
+      - name: Set up Node.js
+        if: steps.detect.outputs.matched == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Pin package version
+        if: steps.detect.outputs.matched == 'true'
+        env:
+          VERSION: ${{ steps.detect.outputs.version }}
+        run: |
+          npm pkg set version="$VERSION"
+          test "$(node -p "require('./package.json').version")" = "$VERSION"
+
+      - name: Test
+        if: steps.detect.outputs.matched == 'true'
+        run: npm test
+
+      - name: Generate release notes
+        if: steps.detect.outputs.matched == 'true'
+        env:
+          VERSION: ${{ steps.detect.outputs.version }}
+        run: |
+          node scripts/release-notes.mjs \
+            --version "$VERSION" \
+            --output RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
+      - name: Pack tarball
+        if: steps.detect.outputs.matched == 'true'
+        run: |
+          npm pack --json > pack.json
+          TARBALL="$(node -p "JSON.parse(require('fs').readFileSync('pack.json', 'utf8'))[0].filename")"
+          echo "TARBALL=${TARBALL}" >> "$GITHUB_ENV"
+          echo "Packed ${TARBALL}"
+
+      - name: Create GitHub release
+        if: steps.detect.outputs.matched == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.detect.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists — refreshing its asset and notes."
+            gh release upload "$TAG" "$TARBALL" --clobber
+            gh release edit "$TAG" --notes-file RELEASE_NOTES.md
+          else
+            gh release create "$TAG" "$TARBALL" \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --notes-file RELEASE_NOTES.md
+          fi

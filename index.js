@@ -1,16 +1,16 @@
 /**
  * Smart commit — Host half.
  *
- * The commit workflow runs here, in the Host process, on the Session's working
- * directory. No model request is involved: the button executes one command,
- * the command runs git, and the result comes back as text.
+ * The Host exposes one authenticated JSON channel under `/dsh-git-commit` on
+ * the composition's web server. The Client calls `analyze`, `name`, and
+ * `commit` directly; nothing goes through the command pipeline, so no command
+ * node is written to the Session and no structured plan has to travel as text.
  *
- * Two steps share the `/smart-commit` command:
- *   1. no argument  → probe the repo, collect the working tree, group it by
- *                     Angular type and scope, build one message per group, and
- *                     keep that plan for this Session;
- *   2. `commit <json>` → validate the (possibly edited) messages and commit
- *                     group by group, refusing anything the skill forbids.
+ *   - `analyze` is fast: VCS status plus type/scope grouping.
+ *   - `name` is the one slow model call; it runs after the dialog is already
+ *     on screen, so the user sees progress instead of a stuck command.
+ *   - `commit` re-analyzes the working tree, rejects a plan whose file groups
+ *     changed meanwhile, validates every message, then commits group by group.
  *
  * @module dsh-smart-commit
  */
@@ -21,18 +21,34 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import {
+  resolveSvn,
+  svnCommitGroup,
+  svnDiff,
+  svnInfo,
+  svnRemaining,
+  svnStatus,
+} from './svn.js';
+
 export const name = '@eternalheart/dsh-git-commit';
-export const inject = ['commands'];
+export const inject = [];
 
 /** Angular type enum from @commitlint/config-angular. */
 const TYPES = ['build', 'ci', 'docs', 'feat', 'fix', 'perf', 'refactor', 'revert', 'style', 'test'];
-/** A plan older than this is discarded; the working tree may have moved on. */
-const PLAN_TTL_MS = 10 * 60 * 1000;
 const HEADER_LIMIT = 72;
 const SUBJECT_LIMIT = 50;
 
+/** The one HTTP prefix this plugin owns on the composition's web server. */
+export const API_PREFIX = '/dsh-git-commit';
+/** Inline API revision; the Client names it when it needs to explain a mismatch. */
+export const API_VERSION = 3;
+/** Requests carry at most a plan, its paths, and the edited messages. */
+const BODY_LIMIT = 2 * 1024 * 1024;
+
 const DEFAULTS = Object.freeze({
   gitPath: '',
+  svnPath: '',
+  vcs: 'auto',
   timeoutMs: 20000,
   maxGroups: 6,
   useModel: true,
@@ -72,9 +88,6 @@ const TEST_RE =
 const BUILD_RE =
   /(^|\/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb|pnpm-workspace\.yaml|tsconfig[^/]*\.json|[a-z0-9._-]+\.config\.(js|mjs|cjs|ts|cts|mts)|Dockerfile[^/]*|docker-compose[^/]*\.ya?ml|Makefile|\.npmrc|\.nvmrc|\.editorconfig|\.prettierrc[^/]*|\.prettierignore|\.eslintrc[^/]*|eslint\.config\.(js|mjs|cjs)|pyproject\.toml|requirements[^/]*\.txt|go\.mod|go\.sum|Cargo\.toml|Cargo\.lock|pom\.xml|build\.gradle[^/]*|settings\.gradle[^/]*|\.gitignore|\.dockerignore)$/i;
 
-/** One plan per Session, in Host memory only. */
-const plans = new Map();
-
 /**
  * Fold the Loader row's config over this plugin's defaults.
  * @param raw - the row's `config` value.
@@ -88,6 +101,11 @@ export function resolveConfig(raw) {
       typeof source.gitPath === 'string' && source.gitPath.trim() !== ''
         ? source.gitPath.trim()
         : DEFAULTS.gitPath,
+    svnPath:
+      typeof source.svnPath === 'string' && source.svnPath.trim() !== ''
+        ? source.svnPath.trim()
+        : DEFAULTS.svnPath,
+    vcs: ['auto', 'git', 'svn'].includes(source.vcs) ? source.vcs : DEFAULTS.vcs,
     timeoutMs: positive(source.timeoutMs, DEFAULTS.timeoutMs),
     maxGroups: Math.max(1, Math.round(positive(source.maxGroups, DEFAULTS.maxGroups))),
     useModel: source.useModel !== false,
@@ -421,14 +439,39 @@ export function groupEntries(entries, maxGroups = DEFAULTS.maxGroups) {
 }
 
 /**
- * Inspect a repository and build a commit plan.
+ * Inspect a working tree and build a commit plan.
+ *
+ * `auto` prefers Git: a directory that is both a Git and an SVN working copy
+ * (a git-svn checkout, for example) is committed through git, because that is
+ * where the history the Session sees lives.
+ *
+ * @param options - binaries, directory, limits, and the `auto|git|svn` mode.
+ * @returns a plan, or a failure description (with `notRepo` when nothing matched).
+ */
+export async function analyzeRepo(options) {
+  const mode = options.vcs ?? 'git';
+  if (mode === 'svn') return analyzeSvnRepo(options);
+  if (mode === 'git') return analyzeGitRepo(options);
+  const git = await analyzeGitRepo(options);
+  if (git.ok || git.notRepo !== true) return git;
+  const svn = await analyzeSvnRepo(options);
+  if (svn.ok) return svn;
+  return {
+    ok: false,
+    notRepo: true,
+    text: '当前目录既不是 Git 仓库，也不在 SVN 工作副本中，未做任何改动。',
+  };
+}
+
+/**
+ * Build a plan from a Git working tree.
  * @param options - git binary, repository directory, limits.
  * @returns a plan, or a failure description.
  */
-export async function analyzeRepo({ gitBin, cwd, maxGroups, timeoutMs }) {
+async function analyzeGitRepo({ gitBin, cwd, maxGroups, timeoutMs }) {
   const top = await runGit(gitBin, cwd, ['rev-parse', '--show-toplevel'], { timeoutMs });
   if (top.code !== 0) {
-    return { ok: false, text: '当前目录不是 Git 仓库，未做任何改动。' };
+    return { ok: false, notRepo: true, text: '当前目录不是 Git 仓库，未做任何改动。' };
   }
   const toplevel = top.stdout.trim();
   const head = await runGit(gitBin, toplevel, ['rev-parse', '--verify', '-q', 'HEAD'], { timeoutMs });
@@ -447,11 +490,11 @@ export async function analyzeRepo({ gitBin, cwd, maxGroups, timeoutMs }) {
   }
   const entries = parseStatus(status.stdout);
   if (entries.length === 0) {
-    return { ok: false, text: '工作区干净，没有可提交的改动。' };
+    return { ok: false, clean: true, text: '工作区干净，没有可提交的改动。' };
   }
   const { groups, skipped } = groupEntries(entries, maxGroups);
   if (groups.length === 0) {
-    return { ok: false, text: '只剩敏感文件，已全部跳过，没有可提交的内容。' };
+    return { ok: false, clean: true, text: '只剩敏感文件，已全部跳过，没有可提交的内容。' };
   }
   // A non-empty index cannot be committed over without mixing in staged work;
   // the plan carries the exact paths so the dialog can offer to unstage them.
@@ -462,6 +505,7 @@ export async function analyzeRepo({ gitBin, cwd, maxGroups, timeoutMs }) {
   return {
     ok: true,
     plan: {
+      vcs: 'git',
       cwd: toplevel,
       branch,
       hasHead: head.code === 0,
@@ -474,14 +518,77 @@ export async function analyzeRepo({ gitBin, cwd, maxGroups, timeoutMs }) {
 }
 
 /**
+ * Build a plan from an SVN working copy.
+ *
+ * SVN has no index, so nothing can be "already staged": the plan only records
+ * which paths are unversioned, because those are the ones `svn add` has to
+ * schedule at commit time.
+ *
+ * @param options - svn binary, directory, limits.
+ * @returns a plan, or a failure description.
+ */
+async function analyzeSvnRepo({ svnBin, cwd, maxGroups, timeoutMs }) {
+  const bin = svnBin ?? resolveSvn('');
+  const info = await svnInfo(bin, cwd, timeoutMs);
+  if (!info.ok) {
+    return { ok: false, notRepo: true, text: '当前目录不在 SVN 工作副本中，未做任何改动。' };
+  }
+  const status = await svnStatus(bin, info.root, timeoutMs);
+  if (!status.ok) {
+    return { ok: false, text: `读取 svn status 失败：${status.error}` };
+  }
+  if (status.conflicts.length > 0) {
+    return {
+      ok: false,
+      text: [
+        '工作副本存在未解决的冲突，先处理并执行 svn resolve 后再提交：',
+        ...status.conflicts.map((path) => `   ! ${path}`),
+      ].join('\n'),
+    };
+  }
+  if (status.entries.length === 0) {
+    return { ok: false, clean: true, text: '工作区干净，没有可提交的改动。' };
+  }
+  const { groups, skipped } = groupEntries(status.entries, maxGroups);
+  if (groups.length === 0) {
+    return { ok: false, clean: true, text: '只剩敏感文件，已全部跳过，没有可提交的内容。' };
+  }
+  const warnings = [...status.warnings];
+  if (status.missing.length > 0) {
+    warnings.push(
+      `工作区有 ${status.missing.length} 个文件缺失（未执行 svn delete），已跳过：${status.missing
+        .slice(0, 10)
+        .join('、')}${status.missing.length > 10 ? ' 等' : ''}`,
+    );
+  }
+  return {
+    ok: true,
+    plan: {
+      vcs: 'svn',
+      cwd: info.root,
+      branch: info.branch,
+      hasHead: true,
+      revision: info.revision,
+      staged: [],
+      groups,
+      skipped,
+      warnings,
+      untracked: status.entries.filter((entry) => entry.untracked === true).map((entry) => entry.path),
+      added: status.entries.filter((entry) => entry.code === 'A ').map((entry) => entry.path),
+      at: Date.now(),
+    },
+  };
+}
+
+/**
  * Resolve the model route this Session is already using.
  * @param ctx - plugin context.
- * @param agent - the invoking agent.
+ * @param session - the invoking Session.
  * @returns `{ provider, model, reasoningEffort? }`, or undefined when unknown.
  */
-export function currentRoute(ctx, agent) {
+export function currentRoute(ctx, session) {
   try {
-    const config = agent?.session?.requestHeader?.()?.config;
+    const config = session?.requestHeader?.()?.config;
     if (typeof config?.provider === 'string' && typeof config?.model === 'string') {
       return {
         provider: config.provider,
@@ -526,12 +633,24 @@ async function readSample(path, limit) {
 /**
  * Build the bounded prompt material: per group, its suggestion, paths, and a
  * short diff (new files are sampled instead of diffed).
+ * @param bin - git or svn executable, matching `plan.vcs`.
+ * @param plan - the analyzed plan.
+ * @param options - remaining character budget and command timeout.
+ * @returns the prompt body.
+ */
+export async function buildModelInput(bin, plan, options) {
+  if (plan.vcs === 'svn') return buildSvnModelInput(bin, plan, options);
+  return buildGitModelInput(bin, plan, options);
+}
+
+/**
+ * Prompt material for a Git working tree.
  * @param gitBin - git executable.
  * @param plan - the analyzed plan.
  * @param options - remaining character budget and git timeout.
  * @returns the prompt body.
  */
-export async function buildModelInput(gitBin, plan, { budget, timeoutMs }) {
+async function buildGitModelInput(gitBin, plan, { budget, timeoutMs }) {
   const untrackedRun = await runGit(
     gitBin,
     plan.cwd,
@@ -562,6 +681,55 @@ export async function buildModelInput(gitBin, plan, { budget, timeoutMs }) {
     const samples = [];
     for (const file of group.files) {
       if (!untracked.has(file)) continue;
+      const sample = await readSample(join(plan.cwd, file), remaining);
+      if (sample !== '') samples.push(`--- 新文件 ${file} ---\n${sample}`);
+      if (samples.length >= 5) break;
+    }
+    if (samples.length > 0) body += `${body === '' ? '' : '\n'}${samples.join('\n')}`;
+    if (body.trim() === '') body = '（无可展示的 diff）';
+    if (body.length > remaining) body = `${body.slice(0, remaining)}\n…（已截断）`;
+    remaining -= body.length;
+    parts.push(body);
+  }
+  return parts.join('\n');
+}
+
+/**
+ * Prompt material for an SVN working copy.
+ *
+ * `svn diff` refuses unversioned paths and prints nothing for scheduled adds,
+ * so both are sampled from disk instead; only versioned, already-present paths
+ * go through `svn diff`.
+ *
+ * @param svnBin - svn executable.
+ * @param plan - the analyzed plan.
+ * @param options - remaining character budget and svn timeout.
+ * @returns the prompt body.
+ */
+async function buildSvnModelInput(svnBin, plan, { budget, timeoutMs }) {
+  const untracked = new Set(plan.untracked ?? []);
+  const added = new Set(plan.added ?? []);
+  const parts = [
+    `仓库：${plan.cwd}（SVN）`,
+    `分支：${plan.branch}`,
+    `共 ${plan.groups.length} 组改动。`,
+  ];
+  let remaining = budget;
+  for (let index = 0; index < plan.groups.length; index += 1) {
+    const group = plan.groups[index];
+    const listed = group.files.slice(0, 20).join('、');
+    parts.push(
+      `\n[${index + 1}] 建议 header：${group.message}\n文件（${group.files.length}）：${listed}${group.files.length > 20 ? ' 等' : ''}`,
+    );
+    if (remaining <= 0) {
+      parts.push('（diff 已超出预算，省略）');
+      continue;
+    }
+    const versioned = group.files.filter((file) => !untracked.has(file));
+    let body = await svnDiff(svnBin, plan.cwd, versioned, timeoutMs);
+    const samples = [];
+    for (const file of group.files) {
+      if (!untracked.has(file) && !added.has(file)) continue;
       const sample = await readSample(join(plan.cwd, file), remaining);
       if (sample !== '') samples.push(`--- 新文件 ${file} ---\n${sample}`);
       if (samples.length >= 5) break;
@@ -703,38 +871,25 @@ export function normalizeMessage(message) {
 }
 
 /**
- * Render one plan as the command's human-readable text.
- * @param plan - the analyzed plan.
- * @returns the text shown in the command row and parsed by the button.
+ * Commit one plan group by group, stopping at the first failure.
+ * @param plan - the plan to execute.
+ * @param messages - one validated message per group.
+ * @param options - binaries and timeout; the binary matching `plan.vcs` is used.
+ * @returns the outcome text and whether every group committed.
  */
-export function renderPlan(plan) {
-  const fileCount = plan.groups.reduce((sum, group) => sum + group.files.length, 0);
-  const suffix = plan.hasHead ? plan.branch : '无提交历史';
-  const lines = [`待确认 ${plan.groups.length} 组 / ${fileCount} 个文件 · ${suffix}`];
-  plan.groups.forEach((group, index) => {
-    const label = group.message === '' ? '（待补充 message）' : group.message;
-    lines.push(`${index + 1}. ${label} · ${group.files.length} 个文件`);
-    for (const file of group.files) lines.push(`   - ${file}`);
-  });
-  if (plan.skipped.length > 0) {
-    lines.push(`⚠ 跳过 ${plan.skipped.length} 个敏感文件：${plan.skipped.join('、')}`);
-  }
-  if (Array.isArray(plan.staged) && plan.staged.length > 0) {
-    lines.push(`⚠ 暂存区已有 ${plan.staged.length} 个文件，提交前需先取消暂存：`);
-    for (const path of plan.staged) lines.push(`   ! ${path}`);
-  }
-  if (typeof plan.note === 'string' && plan.note !== '') lines.push(plan.note);
-  return lines.join('\n');
+export async function commitPlan(plan, messages, options) {
+  if (plan.vcs === 'svn') return commitSvnPlan(plan, messages, options);
+  return commitGitPlan(plan, messages, options);
 }
 
 /**
- * Commit one plan group by group, stopping at the first failure.
+ * Commit a Git plan, one group per commit.
  * @param plan - the plan to execute.
  * @param messages - one validated message per group.
  * @param options - git binary and timeout.
  * @returns the outcome text and whether every group committed.
  */
-export async function commitPlan(plan, messages, { gitBin, timeoutMs }) {
+async function commitGitPlan(plan, messages, { gitBin, timeoutMs }) {
   const done = [];
   const lines = [];
 
@@ -821,7 +976,63 @@ export async function commitPlan(plan, messages, { gitBin, timeoutMs }) {
     timeoutMs,
   });
   const remaining = left.stdout.split('\n').filter((line) => line.trim() !== '');
-  const completed = done.length === plan.groups.length;
+  return finishOutcome(done, plan.groups.length, remaining, lines);
+}
+
+/**
+ * Commit an SVN plan: each group is one revision over explicit paths.
+ * @param plan - the plan to execute.
+ * @param messages - one validated message per group.
+ * @param options - svn binary and timeout.
+ * @returns the outcome text and whether every group committed.
+ */
+async function commitSvnPlan(plan, messages, { svnBin, timeoutMs }) {
+  const bin = svnBin ?? resolveSvn('');
+  const done = [];
+  const lines = [];
+  for (let index = 0; index < plan.groups.length; index += 1) {
+    const group = plan.groups[index];
+    const message = messages[index] ?? group.message;
+    const invalid = validateMessage(message);
+    if (invalid !== null) {
+      lines.push(`提交中止：第 ${index + 1} 组 message 不合规——${invalid}`);
+      break;
+    }
+    const result = await svnCommitGroup(
+      bin,
+      plan.cwd,
+      group.files,
+      message,
+      plan.untracked ?? [],
+      timeoutMs,
+    );
+    if (!result.ok) {
+      lines.push(`提交中止：第 ${index + 1} 组提交失败——${result.error}`);
+      if (result.undo === null) {
+        lines.push('已撤销本次 svn add，文件内容仍保留在工作区。');
+      } else if (typeof result.undo === 'string') {
+        lines.push(`⚠ 撤销本次 svn add 未完全成功，请手动检查：${result.undo}`);
+      }
+      break;
+    }
+    const subject = `r${result.revision} ${result.header}`;
+    done.push(subject);
+    lines.push(`OK ${index + 1}. ${subject}`);
+  }
+  const remaining = await svnRemaining(bin, plan.cwd, timeoutMs);
+  return finishOutcome(done, plan.groups.length, remaining, lines);
+}
+
+/**
+ * Shared closing lines for both commit adapters.
+ * @param done - subjects (or revisions) that committed.
+ * @param total - how many groups the plan had.
+ * @param remaining - uncommitted items, already formatted.
+ * @param lines - the running output.
+ * @returns `{ ok, text }`.
+ */
+function finishOutcome(done, total, remaining, lines) {
+  const completed = done.length === total;
   if (completed) {
     lines.push(`提交完成：${done.length} 组。`);
     if (remaining.length > 0) {
@@ -839,17 +1050,17 @@ export async function commitPlan(plan, messages, { gitBin, timeoutMs }) {
 }
 
 /**
- * Resolve the session's working directory for git.
+ * Resolve a Session's working directory.
  * @param ctx - plugin context.
- * @param agent - the invoking agent.
+ * @param session - the Session served by this call.
  * @returns an absolute path.
  */
-function sessionCwd(ctx, agent) {
+function sessionCwd(ctx, session) {
   const directory = ctx.get('workingDirectory');
-  const session = agent?.session;
   if (directory !== undefined && session !== undefined) {
     try {
-      return directory.get(session);
+      const value = directory.get(session);
+      if (typeof value === 'string' && value !== '') return value;
     } catch {
       /* fall through to the session header */
     }
@@ -858,206 +1069,505 @@ function sessionCwd(ctx, agent) {
   return typeof fromHeader === 'string' && fromHeader !== '' ? fromHeader : process.cwd();
 }
 
+/** A business failure the Client can show verbatim. */
+export class ApiError extends Error {
+  /**
+   * @param code - stable machine-readable failure code.
+   * @param message - human-readable explanation.
+   * @param details - optional structured data (paths, per-group reasons).
+   */
+  constructor(code, message, details) {
+    super(message);
+    this.name = 'ApiError';
+    this.code = code;
+    this.details = details;
+  }
+}
+
 /**
- * Build the command handler.
+ * Resolve the Session named by a request.
+ *
+ * The Client only sends an id; the Host resolves the directory, so a request
+ * can never point the commit at a directory the Session does not own.
+ *
+ * @param ctx - plugin context.
+ * @param sessionId - the id the Client named.
+ * @returns `{ session, cwd }`.
+ */
+function resolveTarget(ctx, sessionId) {
+  if (typeof sessionId !== 'string' || sessionId === '') {
+    throw new ApiError('no-session', '没有可用的会话。');
+  }
+  const sessions = ctx.get('sessions');
+  const session = sessions?.get?.(sessionId);
+  if (session === undefined || session === null) {
+    throw new ApiError('no-session', '会话不存在或已关闭，重新打开会话后再试。');
+  }
+  return { session, cwd: sessionCwd(ctx, session) };
+}
+
+/**
+ * The wire form of a plan: no cwd, no timestamps, no host-only fields.
+ * @param plan - the analyzed plan.
+ * @returns the JSON-safe plan the Client edits.
+ */
+export function publicPlan(plan) {
+  return {
+    vcs: plan.vcs,
+    branch: plan.branch,
+    hasHead: plan.hasHead === true,
+    ...(plan.revision === undefined ? {} : { revision: plan.revision }),
+    staged: [...(plan.staged ?? [])],
+    groups: plan.groups.map((group) => ({
+      type: group.type,
+      scope: group.scope,
+      message: typeof group.message === 'string' ? group.message : '',
+      suggestion: typeof group.suggestion === 'string' ? group.suggestion : '',
+      files: [...group.files],
+    })),
+    skipped: [...(plan.skipped ?? [])],
+    warnings: [...(plan.warnings ?? [])],
+    untracked: [...(plan.untracked ?? [])],
+    added: [...(plan.added ?? [])],
+  };
+}
+
+/**
+ * Compare the plan the user confirmed with the tree as it is now.
+ *
+ * Only the grouping matters: messages may differ because that is what the
+ * dialog edits. A different set of files means the working tree moved on and
+ * the confirmed messages no longer describe what would be committed.
+ *
+ * @param submitted - the plan sent back by the Client.
+ * @param fresh - a plan just rebuilt from the working tree.
+ * @throws `ApiError('stale')` when the two describe different changes.
+ */
+export function assertPlanMatches(submitted, fresh) {
+  const groups = Array.isArray(submitted?.groups) ? submitted.groups : null;
+  if (submitted?.vcs !== fresh.vcs || groups === null || groups.length !== fresh.groups.length) {
+    throw new ApiError('stale', '工作区在确认期间发生了变化，请重新分析后再提交。');
+  }
+  for (let index = 0; index < fresh.groups.length; index += 1) {
+    const left = groups[index];
+    const right = fresh.groups[index];
+    const leftFiles = Array.isArray(left?.files) ? [...left.files].sort() : null;
+    const rightFiles = [...right.files].sort();
+    const sameFiles =
+      leftFiles !== null &&
+      leftFiles.length === rightFiles.length &&
+      leftFiles.every((file, position) => file === rightFiles[position]);
+    if (left?.type !== right.type || left?.scope !== right.scope || !sameFiles) {
+      throw new ApiError('stale', '工作区在确认期间发生了变化，请重新分析后再提交。');
+    }
+  }
+}
+
+/**
+ * Run the one model call that names every group.
+ *
+ * A group without a valid model header stays empty; it is never filled with
+ * heuristic text. The dialog still opens, so the user can write that group by
+ * hand and commit the rest.
+ *
  * @param ctx - plugin context.
  * @param config - resolved configuration.
- * @returns a `CommandDefinition['handler']`.
+ * @param plan - a fresh plan whose groups still carry their heuristic headers.
+ * @param options - binaries, model route, request signal, and session id.
+ * @returns `{ messages, note, failures }`.
  */
-export function createHandler(ctx, config) {
+async function namePlan(ctx, config, plan, { signal, sessionId, route, gitBin, svnBin }) {
+  if (!config.useModel) {
+    return {
+      messages: plan.groups.map(() => ''),
+      note: '⚠ 已关闭模型总结，请为每组手动填写 message 后再提交。',
+      failures: [],
+    };
+  }
+  const llm = ctx.get('llm');
+  if (route === undefined || llm === undefined || typeof llm.stream !== 'function') {
+    throw new ApiError(
+      'no-model',
+      '找不到可用的模型路由，无法生成 commit message。没有做任何改动，检查模型配置后再试。',
+    );
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('模型总结超时')), config.modelTimeoutMs);
+  const combined =
+    signal !== undefined && typeof AbortSignal.any === 'function'
+      ? AbortSignal.any([signal, controller.signal])
+      : controller.signal;
+  try {
+    const modelBin = plan.vcs === 'svn' ? svnBin : gitBin;
+    const input = await buildModelInput(modelBin, plan, {
+      budget: config.maxInputChars,
+      timeoutMs: config.timeoutMs,
+    });
+    const raw = await summarizeDiff(llm, route, input, plan.groups.length, {
+      maxTokens: config.maxTokens,
+      signal: combined,
+      sessionId,
+    });
+    const candidates = extractMessages(raw);
+    if (candidates === null) throw new Error('模型输出不是约定的 JSON');
+
+    let { applied, messages, rejected } = applyModelMessages(plan.groups, candidates);
+
+    // One targeted repair round for whatever failed validation.
+    for (let round = 0; round < config.repairRounds && rejected.length > 0; round += 1) {
+      const subset = {
+        ...plan,
+        groups: rejected.map((item) => plan.groups[item.index]),
+      };
+      const repairInput = [
+        '下面这些 commit message 没有通过校验，请重写：',
+        ...rejected.map((item) => {
+          const group = plan.groups[item.index];
+          const shown = item.candidate === '' ? '（没有返回）' : `\`${item.candidate}\``;
+          return `[第 ${item.index + 1} 组] 失败原因：${item.reason}；上次写的是：${shown}；文件（${group.files.length}）：${group.files.slice(0, 10).join('、')}`;
+        }),
+      ].join('\n');
+      const diffInput = await buildModelInput(modelBin, subset, {
+        budget: Math.max(2000, Math.floor(config.maxInputChars / 2)),
+        timeoutMs: config.timeoutMs,
+      });
+      const repairRaw = await summarizeDiff(
+        llm,
+        route,
+        `${repairInput}\n\n${diffInput}`,
+        rejected.length,
+        { maxTokens: config.maxTokens, signal: combined, sessionId },
+      );
+      const repaired = extractMessages(repairRaw);
+      if (repaired === null || repaired.length === 0) break;
+      repaired.forEach((candidate, position) => {
+        const target = rejected[position];
+        if (target === undefined) return;
+        const normalized = normalizeMessage(candidate);
+        const invalid = normalized === '' ? null : validateMessage(normalized);
+        if (invalid === null && normalized !== '') {
+          messages[target.index] = normalized;
+        } else if (invalid !== null) {
+          target.reason = invalid;
+          target.candidate = candidate;
+        }
+      });
+      const still = rejected.filter((item) => messages[item.index] === '');
+      applied = plan.groups.length - still.length;
+      rejected = still;
+    }
+
+    return {
+      messages,
+      note:
+        rejected.length === 0
+          ? `${route.provider}/${route.model} 生成了全部 ${applied} 条 message。`
+          : `⚠ ${rejected.length} 组还没有可用的模型 message（${rejected
+              .map((item) => `第 ${item.index + 1} 组：${item.reason}`)
+              .join('；')}）。可以重试生成，或手动补写后再提交。`,
+      failures: rejected.map((item) => ({ index: item.index, reason: item.reason })),
+    };
+  } catch (error) {
+    if (signal?.aborted === true) throw error;
+    if (controller.signal.aborted) {
+      throw new ApiError(
+        'model-timeout',
+        `模型总结超时（${Math.round(config.modelTimeoutMs / 1000)} 秒），没有做任何改动。再试一次。`,
+      );
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    throw new ApiError('model-failed', `模型总结不可用（${message}）。没有做任何改动，再试一次。`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Build the API the HTTP channel exposes. Pure Host logic: no HTTP concerns.
+ * @param ctx - plugin context.
+ * @param config - resolved configuration.
+ * @returns `{ analyze, name, commit, ping }`.
+ */
+export function createApi(ctx, config) {
   const gitBin = resolveGit(config.gitPath);
+  const svnBin = resolveSvn(config.svnPath);
+  const binaries = { gitBin, svnBin };
 
-  return async function handler(invocation) {
-    const sessionId = invocation?.agent?.id;
-    if (typeof sessionId !== 'string' || sessionId === '') {
-      return { kind: 'error', text: '没有可用的会话。' };
-    }
-    const raw = typeof invocation.rawInput === 'string' ? invocation.rawInput.trim() : '';
-
-    if (raw === 'cancel') {
-      plans.delete(sessionId);
-      return { kind: 'success', text: '已取消待提交的分组。' };
-    }
-
-    if (raw.startsWith('commit')) {
-      const plan = plans.get(sessionId);
-      if (plan === undefined || Date.now() - plan.at > PLAN_TTL_MS) {
-        plans.delete(sessionId);
-        return { kind: 'error', text: '没有待提交的分组，先点一次「提交」分析改动。' };
-      }
-      const payload = raw.slice('commit'.length).trim();
-      let messages = plan.groups.map((group) => group.message);
-      let unstage = false;
-      if (payload !== '') {
-        // The Client sends base64 so no quoting rule in the command line can
-        // corrupt a message; a literal JSON object is accepted as well.
-        let decoded = payload;
-        if (!payload.startsWith('{')) {
-          try {
-            decoded = Buffer.from(payload, 'base64').toString('utf8');
-          } catch {
-            return { kind: 'error', text: '提交参数无法解码。' };
-          }
-        }
-        try {
-          const parsed = JSON.parse(decoded);
-          if (parsed?.messages !== undefined) {
-            if (
-              !Array.isArray(parsed.messages) ||
-              !parsed.messages.every((item) => typeof item === 'string')
-            ) {
-              return { kind: 'error', text: '提交参数格式不正确。' };
-            }
-            messages = parsed.messages;
-          }
-          unstage = parsed?.unstage === true;
-        } catch {
-          return { kind: 'error', text: '提交参数不是合法 JSON。' };
-        }
-      }
-
-      // A pre-existing index would mix somebody else's staging into the first
-      // commit. The dialog can ask to release exactly those paths first.
-      const stagedBefore = Array.isArray(plan.staged) ? plan.staged : [];
-      if (stagedBefore.length > 0) {
-        if (!unstage) {
-          return {
-            kind: 'error',
-            text: `提交中止：暂存区已有 ${stagedBefore.length} 个文件，勾选「先取消暂存」后重试：\n${stagedBefore.join('\n')}`,
-          };
-        }
-        const release = await runGit(gitBin, plan.cwd, ['restore', '--staged', '--', ...stagedBefore], {
-          timeoutMs: config.timeoutMs,
-        });
-        if (release.code !== 0) {
-          return {
-            kind: 'error',
-            text: `提交中止：取消暂存失败——${release.stderr.trim()}`,
-          };
-        }
-        plan.staged = [];
-      }
-
-      plans.delete(sessionId);
-      const outcome = await commitPlan(plan, messages, { gitBin, timeoutMs: config.timeoutMs });
-      return { kind: outcome.ok ? 'success' : 'error', text: outcome.text };
-    }
-
+  /** Rebuild the plan from the tree; a failure becomes a business error. */
+  async function analyzePlan(target) {
     const analysis = await analyzeRepo({
-      gitBin,
-      cwd: sessionCwd(ctx, invocation.agent),
+      ...binaries,
+      vcs: config.vcs,
+      cwd: target.cwd,
       maxGroups: config.maxGroups,
       timeoutMs: config.timeoutMs,
     });
     if (!analysis.ok) {
-      plans.delete(sessionId);
-      return { kind: 'error', text: analysis.text };
+      const code =
+        analysis.clean === true
+          ? 'clean'
+          : analysis.notRepo === true
+            ? 'not-a-repo'
+            : 'analyze-failed';
+      throw new ApiError(code, analysis.text);
+    }
+    return analysis.plan;
+  }
+
+  /** The model route this Session uses, when naming is on. */
+  function routeFor(target) {
+    return config.useModel ? currentRoute(ctx, target.session) : undefined;
+  }
+
+  /**
+   * Fast step: status, grouping, and the model route, with every editable
+   * message still empty.
+   */
+  async function analyze(payload) {
+    const target = resolveTarget(ctx, payload?.sessionId);
+    const plan = await analyzePlan(target);
+    for (const group of plan.groups) {
+      group.suggestion = group.message;
+      group.message = '';
+    }
+    const route = routeFor(target);
+    return {
+      api: API_VERSION,
+      plan: publicPlan(plan),
+      useModel: config.useModel,
+      model: route === undefined ? null : `${route.provider}/${route.model}`,
+    };
+  }
+
+  /**
+   * Slow step: name every group with one model call. The plan is rebuilt here,
+   * so a Client cannot smuggle paths into the prompt.
+   */
+  async function nameMessages(payload, { signal } = {}) {
+    const target = resolveTarget(ctx, payload?.sessionId);
+    const plan = await analyzePlan(target);
+    const suggestions = plan.groups.map((group) => group.message);
+    const route = routeFor(target);
+    const named = await namePlan(ctx, config, plan, {
+      signal,
+      sessionId: payload?.sessionId,
+      route,
+      gitBin,
+      svnBin,
+    });
+    plan.groups.forEach((group, index) => {
+      group.suggestion = suggestions[index] ?? '';
+      group.message = named.messages[index] ?? '';
+    });
+    return {
+      plan: publicPlan(plan),
+      messages: named.messages,
+      note: named.note,
+      failures: named.failures,
+      model: route === undefined ? null : `${route.provider}/${route.model}`,
+    };
+  }
+
+  /**
+   * Commit the confirmed plan. The tree is re-read first; a changed grouping
+   * is refused rather than committed under messages written for other files.
+   */
+  async function commit(payload) {
+    const target = resolveTarget(ctx, payload?.sessionId);
+    const fresh = await analyzePlan(target);
+    assertPlanMatches(payload?.plan, fresh);
+
+    const messages = payload?.messages;
+    if (!Array.isArray(messages) || messages.length !== fresh.groups.length) {
+      throw new ApiError('invalid-message', '提交参数与分组数量不一致，请重新分析。');
     }
 
-    // Commit messages must be semantic: every group is named by the model, and
-    // a group the model cannot name stays empty until it is regenerated or the
-    // user writes one. Heuristic text is never used as a final message.
-    if (config.useModel) {
-      const route = currentRoute(ctx, invocation.agent);
-      const llm = ctx.get('llm');
-      if (route === undefined || llm === undefined || typeof llm.stream !== 'function') {
-        return {
-          kind: 'error',
-          text: '找不到可用的模型路由，无法生成 commit message。没有做任何改动，检查模型配置后再试。',
-        };
+    // Check every header before touching the index: one bad group must not
+    // leave the earlier groups committed and the dialog half-done.
+    const problems = [];
+    messages.forEach((message, index) => {
+      if (typeof message !== 'string') {
+        problems.push({ index, reason: 'message 不是字符串' });
+        return;
       }
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(new Error('模型总结超时')), config.modelTimeoutMs);
-      const signal =
-        typeof AbortSignal.any === 'function' && invocation.signal !== undefined
-          ? AbortSignal.any([invocation.signal, controller.signal])
-          : controller.signal;
-      try {
-        const input = await buildModelInput(gitBin, analysis.plan, {
-          budget: config.maxInputChars,
-          timeoutMs: config.timeoutMs,
-        });
-        const raw = await summarizeDiff(llm, route, input, analysis.plan.groups.length, {
-          maxTokens: config.maxTokens,
-          signal,
-          sessionId,
-        });
-        const candidates = extractMessages(raw);
-        if (candidates === null) throw new Error('模型输出不是约定的 JSON');
-
-        let { applied, messages, rejected } = applyModelMessages(analysis.plan.groups, candidates);
-
-        // One targeted repair round for whatever failed validation.
-        for (let round = 0; round < config.repairRounds && rejected.length > 0; round += 1) {
-          const subset = {
-            ...analysis.plan,
-            groups: rejected.map((item) => analysis.plan.groups[item.index]),
-          };
-          const repairInput = [
-            '下面这些 commit message 没有通过校验，请重写：',
-            ...rejected.map((item) => {
-              const group = analysis.plan.groups[item.index];
-              const shown = item.candidate === '' ? '（没有返回）' : `\`${item.candidate}\``;
-              return `[第 ${item.index + 1} 组] 失败原因：${item.reason}；上次写的是：${shown}；文件（${group.files.length}）：${group.files.slice(0, 10).join('、')}`;
-            }),
-          ].join('\n');
-          const diffInput = await buildModelInput(gitBin, subset, {
-            budget: Math.max(2000, Math.floor(config.maxInputChars / 2)),
-            timeoutMs: config.timeoutMs,
-          });
-          const repairRaw = await summarizeDiff(
-            llm,
-            route,
-            `${repairInput}\n\n${diffInput}`,
-            rejected.length,
-            { maxTokens: config.maxTokens, signal, sessionId },
-          );
-          const repaired = extractMessages(repairRaw);
-          if (repaired === null || repaired.length === 0) break;
-          repaired.forEach((candidate, position) => {
-            const target = rejected[position];
-            if (target === undefined) return;
-            const normalized = normalizeMessage(candidate);
-            const invalid = normalized === '' ? null : validateMessage(normalized);
-            if (invalid === null && normalized !== '') {
-              messages[target.index] = normalized;
-            } else if (invalid !== null) {
-              target.reason = invalid;
-              target.candidate = candidate;
-            }
-          });
-          const still = rejected.filter((item) => messages[item.index] === '');
-          applied = analysis.plan.groups.length - still.length;
-          rejected = still;
-        }
-
-        analysis.plan.groups.forEach((group, index) => {
-          group.message = messages[index];
-        });
-        analysis.plan.note =
-          rejected.length === 0
-            ? `${route.provider}/${route.model} 生成了全部 ${applied} 条 message。`
-            : `⚠ ${rejected.length} 组还没有可用的模型 message（${rejected
-                .map((item) => `第 ${item.index + 1} 组：${item.reason}`)
-                .join('；')}）。请点「重新生成」或手动补写后再提交。`;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          kind: 'error',
-          text: `模型总结不可用（${message}）。没有生成分组，也没有做任何改动；再点一次「提交」重试。`,
-        };
-      } finally {
-        clearTimeout(timer);
-      }
-    } else {
-      analysis.plan.groups.forEach((group) => {
-        group.message = '';
+      const invalid = validateMessage(message);
+      if (invalid !== null) problems.push({ index, reason: invalid });
+    });
+    if (problems.length > 0) {
+      throw new ApiError('invalid-message', `${problems.length} 组 message 未通过校验。`, {
+        groups: problems,
       });
-      analysis.plan.note = '⚠ 已关闭模型总结，请为每组手动填写 message 后再提交。';
     }
 
-    plans.set(sessionId, analysis.plan);
-    return { kind: 'success', text: renderPlan(analysis.plan) };
+    // A pre-existing index would mix somebody else's staging into the first
+    // commit. The dialog can ask to release exactly those paths first. SVN has
+    // no index, so this branch is Git-only.
+    if (fresh.vcs === 'git' && fresh.staged.length > 0) {
+      if (payload?.unstage !== true) {
+        throw new ApiError(
+          'staged',
+          `提交中止：暂存区已有 ${fresh.staged.length} 个文件，先勾选「先取消暂存」再提交。`,
+          { paths: fresh.staged },
+        );
+      }
+      const release = await runGit(gitBin, fresh.cwd, ['restore', '--staged', '--', ...fresh.staged], {
+        timeoutMs: config.timeoutMs,
+      });
+      if (release.code !== 0) {
+        throw new ApiError('staged', `提交中止：取消暂存失败——${release.stderr.trim()}`);
+      }
+      fresh.staged = [];
+    }
+
+    const outcome = await commitPlan(fresh, messages, {
+      ...binaries,
+      timeoutMs: config.timeoutMs,
+    });
+    return { ok: outcome.ok, text: outcome.text };
+  }
+
+  return {
+    ping: () => ({ api: API_VERSION, vcs: config.vcs, useModel: config.useModel }),
+    analyze,
+    name: nameMessages,
+    commit,
+  };
+}
+
+/**
+ * Read a JSON request body with a hard byte cap.
+ * @param req - the incoming request.
+ * @returns the parsed body.
+ */
+async function readJsonBody(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > BODY_LIMIT) throw new ApiError('body-too-large', '请求体过大。');
+    chunks.push(chunk);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    throw new ApiError('bad-json', '请求体不是合法 JSON。');
+  }
+}
+
+/**
+ * Write one JSON response.
+ * @param res - the response to own.
+ * @param status - HTTP status.
+ * @param body - JSON-serializable body.
+ */
+function sendJson(res, status, body) {
+  const text = JSON.stringify(body);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(text),
+    'cache-control': 'no-store',
+  });
+  res.end(text);
+}
+
+/**
+ * Adapt the API to the `webServer` prefix route.
+ *
+ * The route is same-origin and authenticated by Connection: the request must
+ * pass the Host/Origin fence, carry the browser session cookie, and speak for
+ * the owner Peer. A request that fails any check never reaches the API.
+ *
+ * @param ctx - plugin context.
+ * @param api - `createApi()` result.
+ * @returns a `webServer` route handler.
+ */
+export function createRouteHandler(ctx, api) {
+  return async function route(req, res) {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { ok: false, error: { code: 'method', message: '只接受 POST。' } });
+      return;
+    }
+    const connection = ctx.get('connection');
+    if (connection === undefined || typeof connection.admit !== 'function') {
+      sendJson(res, 503, { ok: false, error: { code: 'no-connection', message: '连接服务不可用。' } });
+      return;
+    }
+    const admission = connection.admit(req);
+    if ('rejection' in admission) {
+      res.writeHead(admission.rejection);
+      res.end(admission.rejection === 401 ? 'unauthorized' : 'forbidden');
+      return;
+    }
+    if (admission.peer?.principal?.kind !== 'owner') {
+      res.writeHead(403);
+      res.end('forbidden');
+      return;
+    }
+    const pathname = new URL(req.url ?? '/', 'http://x').pathname;
+    const endpoint = pathname.slice(API_PREFIX.length + 1);
+    if (!Object.hasOwn(api, endpoint)) {
+      sendJson(res, 404, { ok: false, error: { code: 'not-found', message: '未知的接口。' } });
+      return;
+    }
+    const type = String(req.headers['content-type'] ?? '')
+      .split(';', 1)[0]
+      .trim()
+      .toLowerCase();
+    if (type !== 'application/json') {
+      sendJson(res, 415, { ok: false, error: { code: 'content-type', message: '请使用 application/json。' } });
+      return;
+    }
+
+    // The browser may close the dialog while the model call is running; tie
+    // the API signal to the response so the Host stops the model stream.
+    const controller = new AbortController();
+    res.on('close', () => {
+      if (!res.writableEnded) controller.abort();
+    });
+
+    let payload;
+    try {
+      payload = await readJsonBody(req);
+    } catch (error) {
+      if (error instanceof ApiError) {
+        sendJson(res, error.code === 'body-too-large' ? 413 : 400, {
+          ok: false,
+          error: { code: error.code, message: error.message },
+        });
+        return;
+      }
+      throw error;
+    }
+
+    try {
+      const value = await api[endpoint](payload, { signal: controller.signal });
+      sendJson(res, 200, { ok: true, value });
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      if (error instanceof ApiError) {
+        sendJson(res, 200, {
+          ok: false,
+          error: {
+            code: error.code,
+            message: error.message,
+            ...(error.details === undefined ? {} : { details: error.details }),
+          },
+        });
+        return;
+      }
+      try {
+        ctx.logger?.warn?.(error);
+      } catch {
+        /* logging must not mask the failure */
+      }
+      sendJson(res, 200, {
+        ok: false,
+        error: {
+          code: 'internal',
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
   };
 }
 
@@ -1068,16 +1578,17 @@ export function createHandler(ctx, config) {
  */
 export function apply(ctx, rawConfig) {
   const config = resolveConfig(rawConfig);
-  const handler = createHandler(ctx, config);
-  ctx.inject(['commands'], (commandCtx) => {
-    commandCtx.effect(() =>
-      commandCtx.commands.register({
-        definitionId: '@eternalheart/dsh-git-commit',
-        name: 'smart-commit',
-        description: '分析工作区改动，按 Angular 规范分组并用当前模型生成 message',
-        input: { hint: '[commit <base64>|cancel]' },
-        handler,
-      }),
+  const api = createApi(ctx, config);
+  const route = createRouteHandler(ctx, api);
+  ctx.inject(['webServer', 'connection'], (webCtx) => {
+    webCtx.effect(
+      () =>
+        webCtx.webServer.register({
+          kind: 'prefix',
+          path: API_PREFIX,
+          handler: route,
+        }),
+      'dsh-git-commit: authenticated JSON channel',
     );
   });
 }
