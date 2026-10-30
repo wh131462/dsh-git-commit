@@ -1,6 +1,6 @@
 {
   "name": "@eternalheart/dsh-git-commit",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "type": "module",
   "description": "One-click git commit for DeepSeek Harness: groups the working tree by Angular type and scope, names every group with the session's current model, then commits it — no chat message, no agent turn.",
   "license": "MIT",

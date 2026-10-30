@@ -47,7 +47,7 @@ plugin_manager install_bundle  target: "@eternalheart/dsh-git-commit"
 plugin_manager install_bundle  target: "github:wh131462/dsh-git-commit"
 
 # from a local tarball
-plugin_manager install_bundle  target: "/absolute/path/eternalheart-dsh-git-commit-2.0.0.tgz"
+plugin_manager install_bundle  target: "/absolute/path/eternalheart-dsh-git-commit-<version>.tgz"
 ```
 
 Or from the Web sidebar: **Plugins → Add plugin** and paste the same spec. The plugin installs into the current profile and applies to every session in it.

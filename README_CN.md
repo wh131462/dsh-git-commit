@@ -47,7 +47,7 @@ plugin_manager install_bundle  target: "@eternalheart/dsh-git-commit"
 plugin_manager install_bundle  target: "github:wh131462/dsh-git-commit"
 
 # 从本地压缩包安装
-plugin_manager install_bundle  target: "/absolute/path/eternalheart-dsh-git-commit-2.0.0.tgz"
+plugin_manager install_bundle  target: "/absolute/path/eternalheart-dsh-git-commit-<version>.tgz"
 ```
 
 也可以在网页侧边栏 **Plugins → Add plugin** 里粘贴同样的 spec。插件安装到当前 profile，对该 profile 下的所有会话生效。
