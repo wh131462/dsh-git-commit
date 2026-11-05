@@ -14,7 +14,7 @@
  * @module dsh-smart-commit/svn
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { lstat, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -25,6 +25,58 @@ const DEFAULT_TIMEOUT = 20000;
 const SKIP_NAMES = new Set(['.svn', '.git', '.DS_Store', 'Thumbs.db', '__pycache__']);
 /** A directory this large is almost certainly not meant to be added as-is. */
 const WALK_LIMIT = 2000;
+/**
+ * UTF-8 locales that still speak English, most preferred first.
+ *
+ * Forcing `C` keeps svn's messages parseable, but it also gives svn an ASCII
+ * native encoding: `svn add` then fails outright on non-ASCII paths
+ * (`E000022: Can't convert string from native encoding to 'UTF-8'`), and log
+ * text read back from the repository arrives as `{U+4E2D}`-style escapes.
+ * `C.UTF-8` and `en_US.UTF-8` keep the untranslated messages this module
+ * matches on while letting UTF-8 through untouched.
+ */
+const UTF8_LOCALES = ['C.UTF-8', 'en_US.UTF-8'];
+/** Resolved once per process; `undefined` until the first svn spawn. */
+let cachedLocale;
+
+/**
+ * Pick the first installed UTF-8 locale from {@link UTF8_LOCALES}.
+ * @returns a locale name; the first candidate when `locale -a` cannot be read.
+ */
+function utf8Locale() {
+  if (cachedLocale !== undefined) return cachedLocale;
+  let installed = [];
+  try {
+    const probe = spawnSync('locale', ['-a'], { encoding: 'utf8' });
+    if (probe.status === 0) {
+      installed = String(probe.stdout)
+        .split('\n')
+        .map((name) => name.trim());
+    }
+  } catch {
+    // No `locale` binary (Windows): the preferred candidate is still usable.
+  }
+  cachedLocale = UTF8_LOCALES.find((name) => installed.includes(name)) ?? UTF8_LOCALES[0];
+  return cachedLocale;
+}
+
+/**
+ * The environment every svn child gets: an English UTF-8 locale, and no
+ * editor or merge tool prompts.
+ * @param env - the caller's environment.
+ * @returns a copy of `env` with the locale overridden.
+ */
+export function svnEnv(env = process.env) {
+  const locale = utf8Locale();
+  return {
+    ...env,
+    LC_ALL: locale,
+    LANG: locale,
+    LC_CTYPE: locale,
+    SVN_EDITOR: 'true',
+    SVN_MERGE: 'true',
+  };
+}
 
 /**
  * Locate an svn binary that works even under a Finder-launched PATH.
@@ -70,14 +122,7 @@ export function runSvn(bin, args, options = {}) {
       child = spawn(bin, ['--non-interactive', ...args], {
         cwd,
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: {
-          ...process.env,
-          // Keep messages stable for parsing; this plugin writes its own copy.
-          LC_ALL: 'C',
-          LANG: 'C',
-          SVN_EDITOR: 'true',
-          SVN_MERGE: 'true',
-        },
+        env: svnEnv(),
       });
     } catch (error) {
       resolve({ code: -1, stdout: '', stderr: error instanceof Error ? error.message : String(error) });

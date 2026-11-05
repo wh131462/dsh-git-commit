@@ -21,10 +21,24 @@ import {
   parseSvnInfoXml,
   parseSvnStatusXml,
   svnCommitGroup,
+  svnEnv,
   svnStatus,
 } from '../svn.js';
 
 const exec = promisify(execFile);
+const SVN_ENV = svnEnv();
+
+/**
+ * Run an svn tool the way the plugin does, with the same UTF-8 locale: the
+ * suite must not depend on the shell that launched it having a UTF-8 locale.
+ * @param bin - svn executable.
+ * @param args - arguments.
+ * @param options - execFile options.
+ * @returns the execFile promise.
+ */
+function svnExec(bin, args, options = {}) {
+  return exec(bin, args, { env: SVN_ENV, ...options });
+}
 const GIT = 'git';
 const SVN = process.env.SVN_BIN ?? 'svn';
 const SVNADMIN = process.env.SVNADMIN_BIN ?? 'svnadmin';
@@ -45,13 +59,13 @@ async function createSvnWorkingCopy() {
   const root = await mkdtemp(join(tmpdir(), 'dsh-sc-svn-'));
   const repo = join(root, 'repo');
   const wc = join(root, 'wc');
-  await exec(SVNADMIN, ['create', repo]);
-  await exec(SVN, ['checkout', pathToFileURL(repo).href, wc]);
+  await svnExec(SVNADMIN, ['create', repo]);
+  await svnExec(SVN, ['checkout', pathToFileURL(repo).href, wc]);
   await mkdir(join(wc, 'src'));
   await writeFile(join(wc, 'README.md'), '# Repo\n', 'utf8');
   await writeFile(join(wc, 'src', 'app.js'), 'export const app = 1;\n', 'utf8');
-  await exec(SVN, ['add', '--parents', 'README.md', 'src/app.js'], { cwd: wc });
-  await exec(SVN, ['commit', '-m', 'docs: 初始化 README'], { cwd: wc });
+  await svnExec(SVN, ['add', '--parents', 'README.md', 'src/app.js'], { cwd: wc });
+  await svnExec(SVN, ['commit', '-m', 'docs: 初始化 README'], { cwd: wc });
   return {
     root,
     repo,
@@ -84,7 +98,7 @@ async function populate(wc) {
  * @returns the youngest revision number.
  */
 async function youngest(repo) {
-  const { stdout } = await exec(SVNLOOK, ['youngest', repo]);
+  const { stdout } = await svnExec(SVNLOOK, ['youngest', repo]);
   return Number(stdout.trim());
 }
 
@@ -216,9 +230,9 @@ test('analyzes and commits a real SVN working copy', { skip: !HAS_SVN }, async (
     assert.match(outcome.text, /OK 1\. r\d+/);
     assert.equal(await youngest(repo.repo), before + plan.groups.length);
 
-    const status = await exec(SVN, ['status'], { cwd: repo.wc });
+    const status = await svnExec(SVN, ['status'], { cwd: repo.wc });
     assert.equal(status.stdout.trim(), '?       pkg/.env');
-    const log = await exec(SVNLOOK, ['log', '-r', String(before + 1), repo.repo]);
+    const log = await svnExec(SVNLOOK, ['log', '-r', String(before + 1), repo.repo]);
     assert.match(log.stdout, /docs: 补充 README 说明/);
   } finally {
     await repo.cleanup();
@@ -268,12 +282,12 @@ test('refuses to analyze a conflicted working copy', { skip: !HAS_SVN }, async (
   const repo = await createSvnWorkingCopy();
   const other = join(repo.root, 'other');
   try {
-    await exec(SVN, ['checkout', pathToFileURL(repo.repo).href, other]);
+    await svnExec(SVN, ['checkout', pathToFileURL(repo.repo).href, other]);
     await writeFile(join(other, 'README.md'), '# Repo\n\n来自另一处。\n', 'utf8');
-    await exec(SVN, ['commit', '-m', 'docs: 另一处修改'], { cwd: other });
+    await svnExec(SVN, ['commit', '-m', 'docs: 另一处修改'], { cwd: other });
 
     await writeFile(join(repo.wc, 'README.md'), '# Repo\n\n本地修改。\n', 'utf8');
-    await exec(SVN, ['--non-interactive', 'update'], { cwd: repo.wc }).catch(() => {});
+    await svnExec(SVN, ['--non-interactive', 'update'], { cwd: repo.wc }).catch(() => {});
 
     const analysis = await analyzeRepo({
       vcs: 'svn',
@@ -317,6 +331,35 @@ test('unschedules only its own added paths when a commit fails', { skip: !HAS_SV
       ['??'],
     );
     assert.equal(await readFile(join(repo.wc, 'new', 'deep', 'n.js'), 'utf8'), 'export const n = 1;\n');
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('adds and commits a non-ASCII path', { skip: !HAS_SVN }, async () => {
+  const repo = await createSvnWorkingCopy();
+  try {
+    const name = 'docs/中文 说明.md';
+    await mkdir(join(repo.wc, 'docs'), { recursive: true });
+    await writeFile(join(repo.wc, name), '# 中文\n', 'utf8');
+
+    const status = await svnStatus(SVN, repo.wc, 20000);
+    assert.equal(status.ok, true);
+    assert.deepEqual(
+      status.entries.filter((entry) => entry.path === name).map((entry) => entry.code),
+      ['??'],
+    );
+
+    const before = await youngest(repo.repo);
+    const outcome = await svnCommitGroup(SVN, repo.wc, [name], 'docs: 补充中文说明', [name], 20000);
+    assert.equal(outcome.ok, true, outcome.error);
+    assert.equal(await youngest(repo.repo), before + 1);
+
+    // Reading the log back must not depend on the caller's locale.
+    const changed = await svnExec(SVNLOOK, ['changed', '-r', String(before + 1), repo.repo]);
+    assert.match(changed.stdout, /中文 说明\.md/u);
+    const log = await svnExec(SVNLOOK, ['log', '-r', String(before + 1), repo.repo]);
+    assert.match(log.stdout, /补充中文说明/u);
   } finally {
     await repo.cleanup();
   }
