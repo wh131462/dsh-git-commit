@@ -34,7 +34,7 @@ The same flow works in a Git repository and in an SVN working copy; `vcs: auto` 
 - **Visible progress, in the dialog.** Clicking opens the dialog immediately: “Reading the working tree” plus a rule-based preview, then “Planning the groups with <model>”, then “Committing”. Closing the dialog aborts the model call.
 - **Git and SVN.** `auto` prefers Git when both exist (a git-svn checkout), otherwise the SVN working copy. Git commits stage explicit paths; SVN commits schedule new files with `svn add` and commit explicit paths, one revision per group.
 - **The model plans the groups, the host checks them.** The model receives a numbered list of every changed path (status, path, type hint, and the diff within budget) and decides the group count and membership, then names each group; `maxGroups` is only a ceiling. The host enforces coverage: files the model never claimed are grouped by the rules, repeated or out-of-range numbers are ignored, and no path is dropped. Docs, tests, CI, and build types are locked to what the path says; only source groups may pick `fix` / `refactor` / `perf`.
-- **Semantic messages, always.** Every group is named by the model. A header that fails the Angular rules is normalized, then retried in one targeted repair round; if it still fails, that group stays blank and the commit is blocked instead of silently falling back to generic text.
+- **Semantic messages, always.** Every group is named by the model, and count-only subjects ("modified 5 files", "update files") are rejected outright. Headers are normalized, then invalid ones get a targeted repair round; groups the model missed, split out, or merged are sent back to the model for naming. A group that still has no valid message stays blank and blocks the commit, while the rule fallback names concrete files or areas (never file counts) and the dialog flags the groups that still need a better name.
 - **No agent turn and no command.** The button calls the plugin's own JSON channel on the host, so no `command/run` node is appended, no chat message is added, no tools run, and a model transport failure cannot leave a commit stuck in the conversation.
 - **The rules live in code.** `@commitlint/config-angular` is enforced by the host: one type per commit, header ≤ 72, subject ≤ 50, explicit paths, no `--amend` / `--force` / `--no-verify`.
 - **Editable grouping and messages.** Before anything is written you can rewrite every message and also rearrange the groups: select files and move them to another group or a new one, drag a file onto a target group, or use ↑ to merge a group into the one above; changed groups are tagged “Grouping changed”. Paths, file counts, skipped sensitive files, and model notes stay visible. Every message is validated before the first group commits, so a bad header in group 3 cannot leave groups 1–2 committed.
@@ -119,7 +119,7 @@ Override the inserted row in the profile's `cordis.patch.yml`:
 | `modelTimeoutMs` | `60000` | Deadline for one model planning call |
 | `maxInputChars` | `32000` | Character budget for one planning request: numbered list plus diff |
 | `maxTokens` | `2000` | Output cap for the summarization |
-| `repairRounds` | `1` | Targeted repair rounds for messages that failed validation (0–3) |
+| `repairRounds` | `1` | Targeted naming rounds for messages that failed validation or still hold a rule placeholder (0–3) |
 
 The model picks the group count; `maxGroups` is only the ceiling. Raise it (for example to `20`) for finer commits, lower it for coarser ones. Large change sets degrade in three steps: numbered paths → numbered rule units (type+scope buckets) when the paths do not fit → rule grouping only when even the units do not fit. The last two modes can still be adjusted in the dialog.
 
@@ -147,7 +147,7 @@ The changed paths are numbered in a fixed order (with status code, a `docs`/`tes
 {"groups":[{"paths":[1,3],"type":"feat","scope":"auth","message":"feat(auth): add login endpoint"}]}
 ```
 
-The host does not take the model's word for the risky parts: every number must be used exactly once, out-of-range and repeated numbers are ignored, and files the model missed are grouped by the rules. Types decided by the path (docs / test / CI / build) are locked; only source groups may choose `fix` / `refactor` / `perf`. Messages are normalized and validated, then invalid ones get one targeted repair round with the failing groups, the exact error, and their diffs; if they still fail, the group stays blank and the commit is blocked. Planning runs after the dialog is already on screen, and closing the dialog aborts the model stream through the request signal.
+The host does not take the model's word for the risky parts: every number must be used exactly once, out-of-range and repeated numbers are ignored, and files the model missed are grouped by the rules. Types decided by the path (docs / test / CI / build) are locked; only source groups may choose `fix` / `refactor` / `perf`. Messages are normalized and validated, then invalid ones get one targeted repair round with the failing groups, the exact error, and their diffs. Groups that the rules had to fill, split, or merge are sent back to the model with their paths and diffs so a count-style subject never becomes a commit message; if naming still fails, the group stays blank and the commit is blocked. Planning runs after the dialog is already on screen, and closing the dialog aborts the model stream through the request signal.
 
 ### 5. Commit
 
@@ -157,6 +157,7 @@ The host does not take the model's word for the risky parts: every number must b
 
 - One Angular `type` per commit; `chore` and unknown types are rejected.
 - Header ≤ 72 chars, lowercase type/scope, subject ≤ 50 chars, no trailing punctuation, no leading capital, no `!` without a `BREAKING CHANGE:` footer.
+- A subject must describe the change; count-only subjects ("modified 5 files", "update 3 docs") and bare "update files" are rejected.
 - Every path is passed to `git add --` explicitly; `-A`, `.`, `-a`, `--amend`, `--force`, and `--no-verify` are never used.
 - A non-empty index aborts the run; the dialog can release exactly the listed paths (the content stays in the working tree).
 - Sensitive files are skipped and reported; a grouping change between confirm and commit is refused.
