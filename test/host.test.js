@@ -320,6 +320,45 @@ test('validates the Angular message rules', () => {
   assert.equal(validateMessage(buildHeader('refactor', 'backend-coal-mind-agent', '更新 一个非常长的文件名.ts')), null);
 });
 
+test('rejects subjects that only report a count or a bare scope', () => {
+  const reason = 'subject 只报了数量或范围，没有写出这组具体改了什么';
+  assert.equal(validateMessage('refactor: 修改了 12 个文件'), reason);
+  assert.equal(validateMessage('docs: 更新 3 个文档'), reason);
+  assert.equal(validateMessage('test: 调整 5 个测试'), reason);
+  assert.equal(validateMessage('build: 更新 3 个配置'), reason);
+  assert.equal(validateMessage('docs: 更新文件'), reason);
+  assert.equal(validateMessage('refactor: 调整'), reason);
+  assert.equal(validateMessage('refactor: changed 12 files'), reason);
+  assert.equal(validateMessage('docs: update files'), reason);
+  // A count of something concrete still describes the change.
+  assert.equal(validateMessage('feat: 新增 2 个接口'), null);
+  assert.equal(validateMessage('perf: 优化列表渲染'), null);
+  assert.equal(validateMessage('feat: add 2 login endpoints'), null);
+});
+
+test('rule messages name paths instead of counting files', () => {
+  const { groups } = groupEntries(
+    [
+      { code: '??', path: 'src/alpha/app.js' },
+      { code: '??', path: 'src/beta/app.js' },
+      { code: ' M', path: 'docs/guide/intro.md' },
+      { code: ' M', path: 'docs/guide/install.md' },
+    ],
+    1,
+  );
+  assert.equal(groups.length, 2);
+  for (const group of groups) {
+    assert.equal(validateMessage(group.message), null, group.message);
+    assert.doesNotMatch(group.message, /\d+\s*个(文件|文档|测试|配置)/, group.message);
+  }
+  const feats = groups.find((group) => group.type === 'feat');
+  assert.match(feats.message, /alpha\/app\.js/);
+  assert.match(feats.message, /beta\/app\.js/);
+  const docs = groups.find((group) => group.type === 'docs');
+  assert.match(docs.message, /intro\.md/);
+  assert.match(docs.message, /install\.md/);
+});
+
 test('analyzes a real working tree into a wire plan', async () => {
   const repo = await createRepo();
   try {
@@ -631,6 +670,31 @@ test('api.name rejects a non-JSON model reply', async () => {
   }
 });
 
+test('api.name repairs a count-style subject instead of committing it', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    const first = JSON.stringify({
+      groups: [
+        { files: ['src/app.js', 'src/util.js'], type: 'feat', message: 'feat: 修改了 2 个文件' },
+        { files: ['README.md'], type: 'docs', message: 'docs: 补充说明' },
+        { files: ['package.json'], type: 'build', message: 'build: 更新包信息' },
+        { files: ['.github/workflows/ci.yml'], type: 'ci', message: 'ci: 调整流水线' },
+        { files: ['test/app.test.js'], type: 'test', message: 'test: 补充用例' },
+      ],
+    });
+    const repaired = JSON.stringify({ messages: ['feat: 新增入口与工具函数'] });
+    const { api } = makeApi(repo.dir, { llm: fakeLlm([first, repaired]) });
+    const named = await api.name({ sessionId: SESSION });
+    assert.equal(named.failures.length, 0);
+    assert.ok(named.messages.includes('feat: 新增入口与工具函数'));
+    assert.ok(!named.messages.some((message) => /\d+\s*个文件/u.test(message)));
+    for (const message of named.messages) assert.equal(validateMessage(message), null, message);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
 test('api.name repairs invalid headers in one targeted round', async () => {
   const repo = await createRepo();
   try {
@@ -787,7 +851,10 @@ test('falls back to rule grouping when even the unit list cannot fit', async () 
     assert.equal(named.failures.length, 0);
     const covered = named.plan.groups.flatMap((group) => group.files).sort();
     assert.equal(covered.length, 30);
-    for (const message of named.messages) assert.equal(validateMessage(message), null, message);
+    for (const message of named.messages) {
+      assert.equal(validateMessage(message), null, message);
+      assert.doesNotMatch(message, /\d+\s*个(文件|文档|测试|配置)/, message);
+    }
   } finally {
     await repo.cleanup();
   }
@@ -864,6 +931,59 @@ test('fills files the model never claimed with rule groups', async () => {
     assert.ok(named.messages.every((message) => message.trim() !== ''));
     assert.match(named.note, /模型没有覆盖/);
     assert.match(named.note, /按规则补成/);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('asks the model to name rule-filled groups instead of keeping placeholders', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    // The first reply only claims one path, so the other five become rule
+    // groups; the second reply names them semantically.
+    const grouped = JSON.stringify({
+      groups: [{ files: ['src/app.js'], type: 'feat', message: 'feat: 新增入口文件' }],
+    });
+    const repaired = JSON.stringify({
+      messages: [
+        'build: 声明 fixture 包信息',
+        'ci: 增加 CI 工作流',
+        'docs: 补充工作区更新说明',
+        'feat: 新增工具函数',
+        'test: 覆盖入口行为',
+      ],
+    });
+    const { api } = makeApi(repo.dir, { llm: fakeLlm([grouped, repaired]) });
+    const named = await api.name({ sessionId: SESSION });
+    assert.equal(named.failures.length, 0);
+    assert.equal(named.messages.length, 6);
+    for (const message of named.messages) assert.equal(validateMessage(message), null, message);
+    assert.ok(named.messages.includes('docs: 补充工作区更新说明'));
+    assert.ok(named.messages.includes('feat: 新增工具函数'));
+    assert.doesNotMatch(named.note, /仍由规则命名/);
+    assert.match(named.note, /生成了全部 6 条 message/);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('groups the model never named keep a path-named message when naming fails', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    const grouped = JSON.stringify({
+      groups: [{ files: ['src/app.js'], type: 'feat', message: 'feat: 新增入口文件' }],
+    });
+    // The naming reply is not the agreed shape, so the rule messages stand.
+    const { api } = makeApi(repo.dir, { llm: fakeLlm([grouped, 'not json at all']) });
+    const named = await api.name({ sessionId: SESSION });
+    assert.equal(named.failures.length, 0);
+    assert.match(named.note, /仍由规则命名/);
+    for (const message of named.messages) {
+      assert.equal(validateMessage(message), null, message);
+      assert.doesNotMatch(message, /\d+\s*个(文件|文档|测试|配置)/, message);
+    }
   } finally {
     await repo.cleanup();
   }
