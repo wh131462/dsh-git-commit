@@ -27,21 +27,34 @@ window.__ModuleLoader__.load({
       'action.failed': 'Failed',
       'action.cleanShort': 'Clean',
       'action.noSession': 'Open a session first.',
-      'action.title': 'Group the working-tree changes and name them with the current model.',
+      'action.title': 'Let the current model decide the commit groups and name each of them.',
       'dialog.title': 'Confirm commit',
-      'dialog.hint': 'Messages are editable; the host validates them before committing.',
+      'dialog.hint': 'The model picks the groups; messages are editable and the host validates them.',
       'dialog.cancel': 'Cancel',
       'dialog.confirm': 'Commit',
       'dialog.committing': 'Committing\u2026',
       'dialog.analyzing': 'Reading the working tree\u2026',
-      'dialog.naming': 'Naming {n} groups with {model}\u2026',
+      'dialog.naming': 'Planning the groups with {model}\u2026',
       'dialog.manual': 'The model did not name every group. Write the missing messages by hand.',
       'dialog.done': 'Result',
       'dialog.close': 'Close',
       'dialog.reanalyze': 'Analyze again',
-      'dialog.regenerate': 'Regenerate messages',
+      'dialog.regenerate': 'Regroup and rename',
       'dialog.files': '{n} files',
       'dialog.more': '+{n} more',
+      'dialog.collapse': 'Show less',
+      'dialog.selected': '{n} files selected',
+      'dialog.moveTo': 'Move selected files to',
+      'dialog.move': 'Move',
+      'dialog.clearSelection': 'Clear selection',
+      'dialog.newGroup': 'New group',
+      'dialog.groupN': 'Group {n}',
+      'dialog.mergeUp': 'Merge this group into the previous one',
+      'dialog.edited': 'Grouping changed',
+      'dialog.selectGroup': 'Select all {n}',
+      'dialog.clearGroup': 'Deselect group',
+      'dialog.regroupHint':
+        'Drag a file onto another group, or select files and move them together (Shift-click extends the selection).',
       'dialog.closeLabel': 'Close dialog',
       'dialog.svnNote':
         'SVN working copy: commits use explicit paths, one revision per group. There is no staging area.',
@@ -63,21 +76,34 @@ window.__ModuleLoader__.load({
       'action.failed': '失败',
       'action.cleanShort': '无改动',
       'action.noSession': '先打开一个会话。',
-      'action.title': '按 Angular 规范分组，并用当前模型为每组生成 message。',
+      'action.title': '由当前模型决定分几组，并为每组生成 message。',
       'dialog.title': '确认提交',
-      'dialog.hint': 'message 可以直接改，提交前由 Host 校验。',
+      'dialog.hint': '分组由模型给出，message 可以直接改，提交前由 Host 校验。',
       'dialog.cancel': '取消',
       'dialog.confirm': '确认提交',
       'dialog.committing': '提交中\u2026',
       'dialog.analyzing': '正在读取工作区\u2026',
-      'dialog.naming': '正在用 {model} 生成 {n} 条 message\u2026',
+      'dialog.naming': '正在用 {model} 规划分组\u2026',
       'dialog.manual': '模型没有为每一组生成 message，缺失的可以手动补写。',
       'dialog.done': '提交结果',
       'dialog.close': '关闭',
       'dialog.reanalyze': '重新分析',
-      'dialog.regenerate': '重新生成 message',
+      'dialog.regenerate': '重新分组并命名',
       'dialog.files': '{n} 个文件',
       'dialog.more': '等 {n} 个',
+      'dialog.collapse': '收起',
+      'dialog.selected': '已选 {n} 个文件',
+      'dialog.moveTo': '把选中的文件移到',
+      'dialog.move': '移动',
+      'dialog.clearSelection': '取消选择',
+      'dialog.newGroup': '新建分组',
+      'dialog.groupN': '第 {n} 组',
+      'dialog.mergeUp': '合并到上一组',
+      'dialog.edited': '分组已调整',
+      'dialog.selectGroup': '全选 {n} 个',
+      'dialog.clearGroup': '取消本组',
+      'dialog.regroupHint':
+        '可以把文件拖到别的分组，也可以点选多个文件后统一移动；Shift 点击连选，或直接全选本组。',
       'dialog.closeLabel': '关闭弹窗',
       'dialog.svnNote': 'SVN 工作副本：按路径提交，每组一个 revision；没有暂存区。',
       'dialog.summary': '{groups} 组 / {files} 个文件 \u00b7 {branch} \u00b7 {vcs}',
@@ -259,6 +285,168 @@ window.__ModuleLoader__.load({
       emit();
     }
 
+    /** Client-side group ids, so a card keeps its identity while regrouping. */
+    let groupSeq = 0;
+
+    function nextGroupId() {
+      groupSeq += 1;
+      return `group-${groupSeq}`;
+    }
+
+    /** Attach a stable id and an `edited` flag to every group of a fresh plan. */
+    function preparePlan(plan) {
+      return {
+        ...plan,
+        groups: plan.groups.map((group) => ({
+          ...group,
+          id: typeof group.id === 'string' && group.id !== '' ? group.id : nextGroupId(),
+          edited: group.edited === true,
+        })),
+      };
+    }
+
+    /**
+     * Toggle one path in the current selection.
+     * @param path - the file chip that was clicked.
+     * @param options - its group id, and whether Shift extends the selection.
+     */
+    function toggleSelected(path, { groupId, shift = false } = {}) {
+      const dialog = store.dialog;
+      if (dialog === null || dialog.phase !== 'edit') return;
+      let selected;
+      if (shift === true && dialog.lastPicked?.groupId === groupId) {
+        const group = dialog.plan.groups.find((item) => item.id === groupId);
+        const from = group === undefined ? -1 : group.files.indexOf(dialog.lastPicked.path);
+        const to = group === undefined ? -1 : group.files.indexOf(path);
+        if (from >= 0 && to >= 0) {
+          const [start, end] = from <= to ? [from, to] : [to, from];
+          selected = [...new Set([...dialog.selected, ...group.files.slice(start, end + 1)])];
+        }
+      }
+      if (selected === undefined) {
+        selected = dialog.selected.includes(path)
+          ? dialog.selected.filter((item) => item !== path)
+          : [...dialog.selected, path];
+      }
+      store.dialog = { ...dialog, selected, lastPicked: { groupId, path }, error: '', messageErrors: [] };
+      emit();
+    }
+
+    /** Select every file of one group, or clear them when all are selected. */
+    function toggleSelectedInGroup(group) {
+      const dialog = store.dialog;
+      if (dialog === null || dialog.phase !== 'edit' || group === undefined) return;
+      const files = new Set(group.files);
+      const all = group.files.every((file) => dialog.selected.includes(file));
+      const selected = all
+        ? dialog.selected.filter((file) => !files.has(file))
+        : [...new Set([...dialog.selected, ...group.files])];
+      store.dialog = { ...dialog, selected, lastPicked: null, error: '', messageErrors: [] };
+      emit();
+    }
+
+    /** Expand or collapse a group's file chips. */
+    function toggleExpanded(id) {
+      const dialog = store.dialog;
+      if (dialog === null) return;
+      const expanded = dialog.expanded.includes(id)
+        ? dialog.expanded.filter((item) => item !== id)
+        : [...dialog.expanded, id];
+      store.dialog = { ...dialog, expanded };
+      emit();
+    }
+
+    /**
+     * Move paths into another group, or into a brand-new one.
+     * @param paths - repository-relative paths that travel together.
+     * @param targetId - an existing group id, or anything else for a new group.
+     */
+    function moveFiles(paths, targetId) {
+      const dialog = store.dialog;
+      if (dialog === null || dialog.phase !== 'edit') return;
+      const moving = new Set(paths.filter((path) => typeof path === 'string' && path !== ''));
+      if (moving.size === 0) return;
+
+      const current = dialog.plan.groups.find((group) => group.id === targetId);
+      if (current !== undefined && [...moving].every((path) => current.files.includes(path))) {
+        store.dialog = { ...dialog, overId: '' };
+        emit();
+        return;
+      }
+
+      const anchor = dialog.plan.groups.find((group) => group.files.some((file) => moving.has(file)));
+      const sourceIds = new Set(
+        dialog.plan.groups
+          .filter((group) => group.files.some((file) => moving.has(file)))
+          .map((group) => group.id),
+      );
+      const groups = dialog.plan.groups.map((group) => ({
+        ...group,
+        files: group.files.filter((file) => !moving.has(file)),
+      }));
+      let target = groups.find((group) => group.id === targetId);
+      if (target === undefined) {
+        target = {
+          id: nextGroupId(),
+          type: anchor?.type ?? 'refactor',
+          scope: anchor?.scope ?? '',
+          message: '',
+          suggestion: '',
+          files: [],
+          edited: true,
+        };
+        groups.push(target);
+      }
+      target.files = [...new Set([...target.files, ...moving])].sort();
+      target.edited = true;
+      for (const group of groups) {
+        // A group that lost files may no longer match its message.
+        if (group.id !== target.id && sourceIds.has(group.id)) group.edited = true;
+      }
+      const kept = groups.filter((group) => group.files.length > 0);
+      store.dialog = {
+        ...dialog,
+        plan: { ...dialog.plan, groups: kept },
+        selected: dialog.selected.filter((path) => !moving.has(path)),
+        expanded: dialog.expanded.filter((id) => kept.some((group) => group.id === id)),
+        overId: '',
+        error: '',
+        messageErrors: [],
+      };
+      emit();
+    }
+
+    /** Move everything currently selected to the chosen target. */
+    function moveSelected(targetId) {
+      const dialog = store.dialog;
+      if (dialog === null) return;
+      moveFiles([...dialog.selected], targetId);
+    }
+
+    /** Merge a group into the one above it, keeping the target's message. */
+    function mergeUp(id) {
+      const dialog = store.dialog;
+      if (dialog === null || dialog.phase !== 'edit') return;
+      const index = dialog.plan.groups.findIndex((group) => group.id === id);
+      if (index <= 0) return;
+      const previous = dialog.plan.groups[index - 1];
+      const group = dialog.plan.groups[index];
+      const merged = {
+        ...previous,
+        files: [...new Set([...previous.files, ...group.files])].sort(),
+        edited: true,
+      };
+      if (merged.message.trim() === '' && group.message.trim() !== '') {
+        merged.message = group.message;
+        merged.suggestion = group.suggestion || merged.suggestion;
+      }
+      const groups = dialog.plan.groups
+        .map((item, position) => (position === index - 1 ? merged : item))
+        .filter((_item, position) => position !== index);
+      store.dialog = { ...dialog, plan: { ...dialog.plan, groups }, error: '', messageErrors: [] };
+      emit();
+    }
+
     /** Analyze, then name; the dialog is on screen from the first phase. */
     async function start(sessionId, tr) {
       if (typeof sessionId !== 'string' || sessionId === '') {
@@ -295,6 +483,11 @@ window.__ModuleLoader__.load({
         result: '',
         ok: true,
         unstage: false,
+        selected: [],
+        expanded: [],
+        overId: '',
+        moveTarget: 'new',
+        lastPicked: null,
       };
       emit();
 
@@ -317,7 +510,7 @@ window.__ModuleLoader__.load({
         store.dialog = {
           ...store.dialog,
           phase: analyzed.useModel ? 'naming' : 'edit',
-          plan: analyzed.plan,
+          plan: preparePlan(analyzed.plan),
           useModel: analyzed.useModel === true,
           model: analyzed.model,
           note: analyzed.useModel ? '' : tr('dialog.manual'),
@@ -331,10 +524,14 @@ window.__ModuleLoader__.load({
           store.dialog = {
             ...store.dialog,
             phase: 'edit',
-            plan: named.plan,
+            plan: preparePlan(named.plan),
             model: named.model,
             note: named.note,
             failures: Array.isArray(named.failures) ? named.failures : [],
+            selected: [],
+            expanded: [],
+            overId: '',
+            moveTarget: 'new',
           };
         } catch (error) {
           if (controller.signal.aborted) return;
@@ -356,7 +553,18 @@ window.__ModuleLoader__.load({
       const dialog = store.dialog;
       if (dialog === null || dialog.phase !== 'edit' || dialog.useModel !== true) return;
       const { requestId, sessionId, controller } = dialog;
-      store.dialog = { ...dialog, phase: 'naming', error: '', stale: false, failures: [], messageErrors: [] };
+      store.dialog = {
+        ...dialog,
+        phase: 'naming',
+        error: '',
+        stale: false,
+        failures: [],
+        messageErrors: [],
+        selected: [],
+        expanded: [],
+        overId: '',
+        moveTarget: 'new',
+      };
       emit();
       try {
         const named = await call('name', { sessionId }, { signal: controller.signal, timeoutMs: NAME_TIMEOUT_MS });
@@ -364,12 +572,16 @@ window.__ModuleLoader__.load({
         store.dialog = {
           ...store.dialog,
           phase: 'edit',
-          plan: named.plan,
+          plan: preparePlan(named.plan),
           model: named.model,
           note: named.note,
           stale: false,
           failures: Array.isArray(named.failures) ? named.failures : [],
           messageErrors: [],
+          selected: [],
+          expanded: [],
+          overId: '',
+          moveTarget: 'new',
         };
       } catch (error) {
         if (controller.signal.aborted) return;
@@ -493,15 +705,31 @@ window.__ModuleLoader__.load({
       '.dsh-sc-x:hover{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);}',
       '.dsh-sc-x:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-1px;}',
       '.dsh-sc-body{flex:1;min-height:0;overflow:auto;padding:2px 18px 8px;}',
-      '.dsh-sc-row{display:flex;align-items:flex-start;gap:8px;padding:6px 0;}',
+      '.dsh-sc-group{display:flex;flex-direction:column;gap:5px;margin:2px 0;padding:8px 8px 9px;border:1px solid transparent;border-radius:10px;transition:border-color .12s ease,background-color .12s ease;}',
+      '.dsh-sc-group:hover{background:var(--dsw-alias-bg-layer-1);}',
+      '.dsh-sc-group[data-over="true"]{border-color:var(--dsw-alias-brand-primary);background:color-mix(in srgb, var(--dsw-alias-brand-primary) 8%, transparent);}',
+      '.dsh-sc-group-head{display:flex;align-items:flex-start;gap:6px;}',
       '.dsh-sc-idx{width:18px;flex:none;padding-top:5px;text-align:right;color:var(--dsw-alias-label-secondary);font-size:11px;font-variant-numeric:tabular-nums;}',
+      '.dsh-sc-tool{flex:none;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;margin-top:2px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:1;cursor:pointer;}',
+      '.dsh-sc-tool:hover{background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);}',
+      '.dsh-sc-tool:disabled{opacity:.5;cursor:progress;}',
+      '.dsh-sc-chips{display:flex;flex-wrap:wrap;gap:4px;padding-left:24px;}',
+      '.dsh-sc-chip{max-width:100%;padding:1px 7px;border:1px solid var(--dsw-alias-border-l1);border-radius:999px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:16px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+      '.dsh-sc-chip:hover{color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l2);}',
+      '.dsh-sc-chip[data-selected="true"]{border-color:var(--dsw-alias-brand-primary);background:color-mix(in srgb, var(--dsw-alias-brand-primary) 10%, transparent);color:var(--dsw-alias-brand-primary);}',
+      '.dsh-sc-chip:disabled{cursor:progress;opacity:.7;}',
+      '.dsh-sc-chip-more{border-style:dashed;}',
+      '.dsh-sc-tag{flex:none;padding:0 6px;border-radius:999px;background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 14%, transparent);color:var(--dsw-alias-state-warn-primary);}',
+      '.dsh-sc-selectbar{position:sticky;top:0;z-index:2;display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:0 0 6px;padding:7px 9px;border-radius:8px;background:color-mix(in srgb, var(--dsw-alias-brand-primary) 10%, var(--dsw-alias-bg-overlay));}',
+      '.dsh-sc-selectbar-count{font-size:11px;color:var(--dsw-alias-label-secondary);}',
+      '.dsh-sc-select{height:24px;max-width:180px;padding:0 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:11px;}',
+      '.dsh-sc-mini{height:24px;padding:0 10px;font-size:11px;}',
       '.dsh-sc-field{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px;}',
       '.dsh-sc-input{width:100%;box-sizing:border-box;min-height:28px;padding:4px 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;line-height:18px;resize:none;overflow:hidden;}',
       '.dsh-sc-input:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-1px;}',
       '.dsh-sc-input:disabled{opacity:.72;cursor:progress;}',
       '.dsh-sc-input[data-loading="true"]{border-style:dashed;}',
       '.dsh-sc-meta{display:flex;align-items:center;gap:8px;font-size:11px;line-height:15px;color:var(--dsw-alias-label-secondary);}',
-      '.dsh-sc-paths{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       '.dsh-sc-count{flex:none;}',
       '.dsh-sc-line{margin-top:1px;font-size:11px;line-height:15px;}',
       '.dsh-sc-line[data-kind="warn"]{color:var(--dsw-alias-state-warn-primary);}',
@@ -683,9 +911,7 @@ window.__ModuleLoader__.load({
         const subtitle = (() => {
           if (phase === 'analyzing') return tr('dialog.analyzing');
           if (phase === 'naming' && plan !== null) {
-            return tr('dialog.naming')
-              .replace('{n}', String(plan.groups.length))
-              .replace('{model}', dialog.model ?? '');
+            return tr('dialog.naming').replace('{model}', dialog.model ?? '');
           }
           if (plan === null) return dialog.error;
           const branch =
@@ -752,9 +978,7 @@ window.__ModuleLoader__.load({
           // `naming` and `edit` share the same footer shape.
           const hint =
             phase === 'naming'
-              ? tr('dialog.naming')
-                  .replace('{n}', String(plan.groups.length))
-                  .replace('{model}', dialog.model ?? '')
+              ? tr('dialog.naming').replace('{model}', dialog.model ?? '')
               : missing > 0
                 ? tr('dialog.missing').replace('{n}', String(missing))
                 : plan.staged.length > 0 && dialog.unstage !== true
@@ -806,67 +1030,247 @@ window.__ModuleLoader__.load({
           ]);
         })();
 
-        // Group rows are shared by naming, edit, and committing.
+        // Group cards are shared by naming, edit, and committing.
+        const selected = new Set(dialog.selected ?? []);
+        const expanded = new Set(dialog.expanded ?? []);
+        const editable = phase === 'edit';
+        const CHIP_LIMIT = 8;
         const rows =
           plan === null
             ? null
             : plan.groups.map((group, index) => {
                 const failure = dialog.failures.find((item) => item.index === index);
                 const invalid = dialog.messageErrors.find((item) => item.index === index);
-                const shown = Array.isArray(group.paths) ? group.paths : group.files;
-                const pathText =
-                  shown.length > 3
-                    ? `${shown.slice(0, 3).join('\u3001')} ${tr('dialog.more').replace('{n}', String(shown.length - 3))}`
-                    : shown.join('\u3001');
-                return h('div', { key: `group-${index}`, className: 'dsh-sc-row' }, [
-                  h('span', { key: 'idx', className: 'dsh-sc-idx' }, String(index + 1)),
-                  h('div', { key: 'field', className: 'dsh-sc-field' }, [
-                    h('textarea', {
-                      key: 'input',
-                      className: 'dsh-sc-input',
-                      value: group.message,
-                      rows: Math.max(1, group.message.split('\n').length),
-                      spellCheck: false,
-                      disabled: phase !== 'edit',
-                      'data-loading': phase === 'naming' ? 'true' : undefined,
-                      placeholder: group.suggestion || tr('dialog.placeholder'),
-                      'aria-label': `commit message ${index + 1}`,
-                      ref: (node) => {
-                        if (node === null) return;
-                        node.style.height = 'auto';
-                        node.style.height = `${node.scrollHeight}px`;
-                      },
-                      onChange: (event) => {
-                        updateMessage(index, event.target.value);
-                        event.target.style.height = 'auto';
-                        event.target.style.height = `${event.target.scrollHeight}px`;
-                      },
-                    }),
-                    h('div', { key: 'meta', className: 'dsh-sc-meta' }, [
-                      h('span', { key: 'paths', className: 'dsh-sc-paths', title: shown.join('\n') }, pathText),
+                const open = expanded.has(group.id);
+                const shown = open ? group.files : group.files.slice(0, CHIP_LIMIT);
+                const hidden = group.files.length - shown.length;
+                return h(
+                  'div',
+                  {
+                    key: group.id,
+                    className: 'dsh-sc-group',
+                    'data-over': dialog.overId === group.id ? 'true' : undefined,
+                    onDragOver: (event) => {
+                      if (!editable) return;
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = 'move';
+                      if (dialog.overId !== group.id) {
+                        store.dialog = { ...store.dialog, overId: group.id };
+                        emit();
+                      }
+                    },
+                    onDragLeave: (event) => {
+                      if (event.currentTarget.contains(event.relatedTarget)) return;
+                      if (dialog.overId === group.id) {
+                        store.dialog = { ...store.dialog, overId: '' };
+                        emit();
+                      }
+                    },
+                    onDrop: (event) => {
+                      if (!editable) return;
+                      event.preventDefault();
+                      moveFiles([event.dataTransfer.getData('text/plain')], group.id);
+                    },
+                  },
+                  [
+                    h('div', { key: 'head', className: 'dsh-sc-group-head' }, [
+                      h('span', { key: 'idx', className: 'dsh-sc-idx' }, String(index + 1)),
+                      h('div', { key: 'field', className: 'dsh-sc-field' }, [
+                        h('textarea', {
+                          key: 'input',
+                          className: 'dsh-sc-input',
+                          value: group.message,
+                          rows: Math.max(1, group.message.split('\n').length),
+                          spellCheck: false,
+                          disabled: !editable,
+                          'data-loading': phase === 'naming' ? 'true' : undefined,
+                          placeholder: group.suggestion || tr('dialog.placeholder'),
+                          'aria-label': `commit message ${index + 1}`,
+                          ref: (node) => {
+                            if (node === null) return;
+                            node.style.height = 'auto';
+                            node.style.height = `${node.scrollHeight}px`;
+                          },
+                          onChange: (event) => {
+                            updateMessage(index, event.target.value);
+                            event.target.style.height = 'auto';
+                            event.target.style.height = `${event.target.scrollHeight}px`;
+                          },
+                          // A dropped chip must not paste its path into the message.
+                          onDrop: (event) => event.preventDefault(),
+                        }),
+                        h('div', { key: 'meta', className: 'dsh-sc-meta' }, [
+                          h(
+                            'span',
+                            { key: 'count', className: 'dsh-sc-count' },
+                            tr('dialog.files').replace('{n}', String(group.files.length)),
+                          ),
+                          group.edited === true
+                            ? h('span', { key: 'edited', className: 'dsh-sc-tag' }, tr('dialog.edited'))
+                            : null,
+                        ]),
+                        failure !== undefined
+                          ? h(
+                              'div',
+                              { key: 'failure', className: 'dsh-sc-line', 'data-kind': 'warn' },
+                              tr('dialog.modelMissing').replace('{reason}', failure.reason),
+                            )
+                          : null,
+                        invalid !== undefined
+                          ? h(
+                              'div',
+                              { key: 'invalid', className: 'dsh-sc-line', 'data-kind': 'error' },
+                              tr('dialog.invalid').replace('{reason}', invalid.reason),
+                            )
+                          : null,
+                      ]),
+                      index > 0
+                        ? h(
+                            'button',
+                            {
+                              key: 'merge',
+                              type: 'button',
+                              className: 'dsh-sc-tool',
+                              title: tr('dialog.mergeUp'),
+                              'aria-label': tr('dialog.mergeUp'),
+                              disabled: !editable,
+                              onClick: () => mergeUp(group.id),
+                            },
+                            '\u2191',
+                          )
+                        : null,
+                    ]),
+                    h('div', { key: 'chips', className: 'dsh-sc-chips' }, [
+                      ...shown.map((file) =>
+                        h(
+                          'button',
+                          {
+                            key: file,
+                            type: 'button',
+                            className: 'dsh-sc-chip',
+                            title: file,
+                            draggable: editable,
+                            disabled: !editable,
+                            'aria-pressed': selected.has(file),
+                            'data-selected': selected.has(file) ? 'true' : undefined,
+                            onDragStart: (event) => {
+                              event.dataTransfer.setData('text/plain', file);
+                              event.dataTransfer.effectAllowed = 'move';
+                            },
+                            onDragEnd: () => {
+                              if (store.dialog !== null && store.dialog.overId !== '') {
+                                store.dialog = { ...store.dialog, overId: '' };
+                                emit();
+                              }
+                            },
+                            onClick: (event) =>
+                              toggleSelected(file, { groupId: group.id, shift: event.shiftKey }),
+                          },
+                          file,
+                        ),
+                      ),
+                      hidden > 0
+                        ? h(
+                            'button',
+                            {
+                              key: 'more',
+                              type: 'button',
+                              className: 'dsh-sc-chip dsh-sc-chip-more',
+                              onClick: () => toggleExpanded(group.id),
+                            },
+                            tr('dialog.more').replace('{n}', String(hidden)),
+                          )
+                        : null,
+                      open && group.files.length > CHIP_LIMIT
+                        ? h(
+                            'button',
+                            {
+                              key: 'less',
+                              type: 'button',
+                              className: 'dsh-sc-chip dsh-sc-chip-more',
+                              onClick: () => toggleExpanded(group.id),
+                            },
+                            tr('dialog.collapse'),
+                          )
+                        : null,
                       h(
-                        'span',
-                        { key: 'count', className: 'dsh-sc-count' },
-                        tr('dialog.files').replace('{n}', String(group.files.length)),
+                        'button',
+                        {
+                          key: 'select-group',
+                          type: 'button',
+                          className: 'dsh-sc-chip dsh-sc-chip-more',
+                          disabled: !editable,
+                          onClick: () => toggleSelectedInGroup(group),
+                        },
+                        group.files.every((file) => selected.has(file))
+                          ? tr('dialog.clearGroup')
+                          : tr('dialog.selectGroup').replace('{n}', String(group.files.length)),
                       ),
                     ]),
-                    failure !== undefined
-                      ? h(
-                          'div',
-                          { key: 'failure', className: 'dsh-sc-line', 'data-kind': 'warn' },
-                          tr('dialog.modelMissing').replace('{reason}', failure.reason),
-                        )
-                      : null,
-                    invalid !== undefined
-                      ? h(
-                          'div',
-                          { key: 'invalid', className: 'dsh-sc-line', 'data-kind': 'error' },
-                          tr('dialog.invalid').replace('{reason}', invalid.reason),
-                        )
-                      : null,
-                  ]),
-                ]);
+                  ],
+                );
               });
+
+        const moveTarget =
+          plan !== null && plan.groups.some((group) => group.id === dialog.moveTarget)
+            ? dialog.moveTarget
+            : 'new';
+        const selectionBar =
+          plan === null || !editable || selected.size === 0
+            ? null
+            : h('div', { key: 'selection', className: 'dsh-sc-selectbar' }, [
+                h(
+                  'span',
+                  { key: 'count', className: 'dsh-sc-selectbar-count', role: 'status', 'aria-live': 'polite' },
+                  tr('dialog.selected').replace('{n}', String(selected.size)),
+                ),
+                h(
+                  'select',
+                  {
+                    key: 'target',
+                    className: 'dsh-sc-select',
+                    value: moveTarget,
+                    'aria-label': tr('dialog.moveTo'),
+                    onChange: (event) => {
+                      store.dialog = { ...store.dialog, moveTarget: event.target.value };
+                      emit();
+                    },
+                  },
+                  [
+                    ...plan.groups.map((group, index) =>
+                      h(
+                        'option',
+                        { key: group.id, value: group.id },
+                        tr('dialog.groupN').replace('{n}', String(index + 1)),
+                      ),
+                    ),
+                    h('option', { key: 'new', value: 'new' }, tr('dialog.newGroup')),
+                  ],
+                ),
+                h(
+                  'button',
+                  {
+                    key: 'move',
+                    type: 'button',
+                    className: 'dsh-sc-primary dsh-sc-mini',
+                    onClick: () => moveSelected(moveTarget),
+                  },
+                  tr('dialog.move'),
+                ),
+                h(
+                  'button',
+                  {
+                    key: 'clear',
+                    type: 'button',
+                    className: 'dsh-sc-ghost dsh-sc-mini',
+                    onClick: () => {
+                      store.dialog = { ...store.dialog, selected: [] };
+                      emit();
+                    },
+                  },
+                  tr('dialog.clearSelection'),
+                ),
+              ]);
 
         let body;
         if (phase === 'analyzing') {
@@ -888,9 +1292,7 @@ window.__ModuleLoader__.load({
             phase === 'naming'
               ? h(Progress, {
                   key: 'progress',
-                  text: tr('dialog.naming')
-                    .replace('{n}', String(plan.groups.length))
-                    .replace('{model}', dialog.model ?? ''),
+                  text: tr('dialog.naming').replace('{model}', dialog.model ?? ''),
                 })
               : phase === 'committing'
                 ? h(Progress, { key: 'progress', text: tr('dialog.committing') })
@@ -899,6 +1301,10 @@ window.__ModuleLoader__.load({
             progress,
             dialog.error !== ''
               ? h('div', { key: 'error', className: 'dsh-sc-warn', role: 'alert' }, dialog.error)
+              : null,
+            selectionBar,
+            phase === 'edit'
+              ? h('div', { key: 'regroup-hint', className: 'dsh-sc-note' }, tr('dialog.regroupHint'))
               : null,
             ...(rows ?? []),
             plan.skipped.length > 0
@@ -963,8 +1369,21 @@ window.__ModuleLoader__.load({
       };
     }
 
+    const testHooks = {
+      store,
+      preparePlan,
+      moveFiles,
+      moveSelected,
+      mergeUp,
+      toggleSelected,
+      toggleSelectedInGroup,
+      toggleExpanded,
+    };
+
     return {
       inject: ['slots', 'locale'],
+      // Regrouping is pure bookkeeping; expose it to the Node tests only.
+      ...(window.__DSH_SMART_COMMIT_TEST__ === true ? { __test: testHooks } : {}),
       apply(ctx) {
         try {
           ctx.effect(() => ctx.locale.register(NS, 'en', EN), 'smart-commit:locale-en');

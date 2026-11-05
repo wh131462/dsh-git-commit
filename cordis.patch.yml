@@ -12,13 +12,13 @@
         svnPath: ''
         # Per-invocation git/svn deadline.
         timeoutMs: 20000
-        # Above this many type+scope groups, whole types are consolidated.
-        maxGroups: 6
-        # One model call names every group, using this Session's current route.
+        # Ceiling for the model's own grouping; past it, whole types merge.
+        maxGroups: 12
+        # One model call decides the groups and names them, on this Session's route.
         useModel: true
         modelTimeoutMs: 60000
-        # Diff characters sent to the model (bounded prompt).
-        maxInputChars: 24000
+        # Character budget for one planning request: numbered list plus diff.
+        maxInputChars: 32000
         maxTokens: 2000
         # Extra targeted model rounds for headers that failed validation.
         repairRounds: 1
