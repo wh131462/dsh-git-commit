@@ -10,18 +10,24 @@ import { promisify } from 'node:util';
 import {
   analyzeRepo,
   apply,
+  applyModelGroups,
   assertPlanMatches,
+  buildGroupingInput,
+  buildUnitGroupingInput,
+  expandUnitGroups,
   buildHeader,
   buildModelInput,
   classify,
   commitPlan,
   createApi,
   createRouteHandler,
+  extractGroupPlan,
   extractMessages,
   groupEntries,
   isSensitive,
   normalizeMessage,
   parseStatus,
+  planFromSubmitted,
   publicPlan,
   resolveConfig,
   scopeOf,
@@ -144,23 +150,60 @@ function fakeLlm(reply, { fail = false } = {}) {
   };
 }
 
-/** A stub LLM that answers with one valid header per requested group. */
+/** The prompt text a stub call received. */
+function promptText(options) {
+  return options.messages
+    .flatMap((message) => message.content ?? [])
+    .map((block) => block.text ?? '')
+    .join('\n');
+}
+
+/**
+ * The stub's grouping answer: cluster the numbered file list by type hint.
+ * @param text - the grouping prompt.
+ * @returns `{ groups }` in the agreed shape.
+ */
+/** One stub group per rule bucket, matching the host's own classification. */
+function autoGrouping(text) {
+  const units = [...text.matchAll(/^\[(\d+)\] ([a-z-]+)(?:\/[^\s·]+)? · /gmu)];
+  if (units.length > 0) {
+    return {
+      groups: [
+        {
+          units: units.map((match) => Number(match[1])),
+          type: 'refactor',
+          scope: '',
+          message: 'refactor: 模型按单元合并',
+        },
+      ],
+    };
+  }
+  const byType = new Map();
+  for (const line of text.split('\n')) {
+    const match = /^(\d+)\.\s+(.{2})\s+(.*?)(?:\s+\[([a-z]+)\])?$/u.exec(line);
+    if (match === null) continue;
+    const type = match[4] ?? classify(match[3], match[2]);
+    if (!byType.has(type)) byType.set(type, []);
+    byType.get(type).push(Number(match[1]));
+  }
+  return {
+    groups: [...byType.entries()].map(([type, paths], position) => ({
+      paths,
+      type,
+      scope: '',
+      message: `${type}: 模型生成第 ${position + 1} 组`,
+    })),
+  };
+}
+
+/** A stub LLM that plays the grouping protocol and names each group. */
 function autoLlm() {
   return {
     async resolveModelInfo() {
       return { reasoning: { efforts: [{ id: 'off' }, { id: 'high' }] } };
     },
     async *stream(options) {
-      const text = options.messages
-        .flatMap((message) => message.content ?? [])
-        .map((block) => block.text ?? '')
-        .join('\n');
-      const count = Number(/共 (\d+) 组改动/.exec(text)?.[1] ?? 0);
-      const messages = Array.from(
-        { length: count },
-        (_, index) => `refactor(model): 模型生成第 ${index + 1} 条`,
-      );
-      yield { type: 'text-delta', text: JSON.stringify({ messages }) };
+      yield { type: 'text-delta', text: JSON.stringify(autoGrouping(promptText(options))) };
       yield { type: 'finish', reason: { kind: 'stop' } };
     },
   };
@@ -439,17 +482,23 @@ test('api.analyze refuses an unknown session', async () => {
   }
 });
 
-test('api.name fills every group in one model call', async () => {
+test('api.name lets the model group the files and names every group', async () => {
   const repo = await createRepo();
   try {
     await populate(repo.dir);
-    const generated = Array.from({ length: 5 }, (_, index) => `refactor(model): 模型生成 message ${index + 1}`);
-    const { api } = makeApi(repo.dir, { llm: fakeLlm(JSON.stringify({ messages: generated })) });
+    const { api } = makeApi(repo.dir);
+    const analyzed = await api.analyze({ sessionId: SESSION });
     const named = await api.name({ sessionId: SESSION });
-    assert.deepEqual(named.messages, generated);
     assert.equal(named.failures.length, 0);
+    assert.equal(named.messages.length, named.plan.groups.length);
+    for (const message of named.messages) assert.equal(validateMessage(message), null, message);
+    // One file per type in the fixture, so the stub's type grouping keeps 5.
+    assert.equal(named.plan.groups.length, 5);
+    assert.match(named.note, /分成 5 组/);
     assert.match(named.note, /生成了全部 5 条 message/);
-    assert.match(named.plan.groups[0].message, /模型生成/);
+    const before = analyzed.plan.groups.flatMap((group) => group.files).sort();
+    const after = named.plan.groups.flatMap((group) => group.files).sort();
+    assert.deepEqual(after, before);
   } finally {
     await repo.cleanup();
   }
@@ -587,21 +636,22 @@ test('api.name repairs invalid headers in one targeted round', async () => {
   try {
     await populate(repo.dir);
     const first = JSON.stringify({
-      messages: [
-        'build(backend-coal-mind-agent): 更新镜像权限',
-        'chore: 杂务',
-        'docs: 补充说明',
-        '没有格式',
-        'test(backend-coal-mind-agent): 补充文档用例',
+      groups: [
+        { files: ['.github/workflows/ci.yml'], type: 'ci', message: 'ci: 调整流水线' },
+        { files: ['README.md'], type: 'docs', message: 'docs: 补充说明' },
+        { files: ['package.json'], type: 'build', message: 'chore: 升级依赖' },
+        { files: ['src/app.js', 'src/util.js'], type: 'feat', message: 'feat: 新增工具模块' },
+        { files: ['test/app.test.js'], type: 'test', message: 'test: 补充用例' },
       ],
     });
-    const repaired = JSON.stringify({ messages: ['ci: 调整流水线', 'feat(agent): 新增文档生成能力'] });
+    const repaired = JSON.stringify({ messages: ['build: 更新依赖字段'] });
     const { api } = makeApi(repo.dir, { llm: fakeLlm([first, repaired]) });
     const named = await api.name({ sessionId: SESSION });
     assert.equal(named.failures.length, 0);
-    assert.match(named.note, /生成了全部 5 条 message/);
-    assert.ok(named.messages.includes('ci: 调整流水线'));
-    assert.ok(named.messages.includes('feat(agent): 新增文档生成能力'));
+    assert.match(named.note, /分成 5 组/);
+    assert.equal(named.messages.length, 5);
+    assert.ok(named.messages.includes('build: 更新依赖字段'));
+    for (const message of named.messages) assert.equal(validateMessage(message), null, message);
   } finally {
     await repo.cleanup();
   }
@@ -612,24 +662,307 @@ test('api.name leaves a still-invalid group empty instead of guessing', async ()
   try {
     await populate(repo.dir);
     const first = JSON.stringify({
-      messages: [
-        'chore: 杂务',
-        'docs: 补充说明',
-        'build: 更新依赖',
-        'test: 补充用例',
-        'ci: 调整流水线',
+      groups: [
+        { files: ['README.md'], type: 'docs', message: 'chore: 杂务' },
+        { files: ['src/app.js', 'src/util.js'], type: 'feat', message: 'feat: 新增工具模块' },
+        { files: ['test/app.test.js'], type: 'test', message: 'test: 补充用例' },
       ],
     });
     const repaired = JSON.stringify({ messages: ['chore: 还是杂务'] });
     const { api } = makeApi(repo.dir, { llm: fakeLlm([first, repaired]) });
     const named = await api.name({ sessionId: SESSION });
     assert.equal(named.failures.length, 1);
+    assert.equal(named.failures[0].index, 0);
     assert.equal(named.messages[0], '');
     assert.match(named.note, /1 组还没有可用的模型 message/);
     assert.match(named.note, /chore/);
   } finally {
     await repo.cleanup();
   }
+});
+
+test('commits the model grouping instead of the rule preview', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    await mkdir(join(repo.dir, 'api'), { recursive: true });
+    await writeFile(join(repo.dir, 'api', 'handler.js'), 'export const h = 1;\n', 'utf8');
+
+    const grouped = JSON.stringify({
+      groups: [
+        {
+          files: ['api/handler.js', 'src/app.js', 'src/util.js'],
+          type: 'feat',
+          message: 'feat: 新增接口与工具模块',
+        },
+        { files: ['README.md'], type: 'docs', message: 'docs: 补充说明' },
+        { files: ['package.json'], type: 'build', message: 'build: 更新包信息' },
+        { files: ['.github/workflows/ci.yml'], type: 'ci', message: 'ci: 调整流水线' },
+        { files: ['test/app.test.js'], type: 'test', message: 'test: 补充用例' },
+      ],
+    });
+    const { api } = makeApi(repo.dir, { llm: fakeLlm(grouped) });
+    const analyzed = await api.analyze({ sessionId: SESSION });
+    // The rules keep the two `feat` scopes apart; the model merges them.
+    assert.equal(analyzed.plan.groups.length, 6);
+
+    const named = await api.name({ sessionId: SESSION });
+    assert.equal(named.plan.groups.length, 5);
+    const merged = named.plan.groups.find((group) => group.message === 'feat: 新增接口与工具模块');
+    assert.deepEqual(merged.files, ['api/handler.js', 'src/app.js', 'src/util.js']);
+
+    const outcome = await api.commit({
+      sessionId: SESSION,
+      plan: named.plan,
+      messages: named.messages,
+      unstage: false,
+    });
+    assert.equal(outcome.ok, true, outcome.text);
+    assert.match(outcome.text, /提交完成：5 组/);
+
+    // The merged group is one commit that holds all three paths.
+    const first = await exec(GIT, ['show', '--name-only', '--format=%s', 'HEAD~4'], { cwd: repo.dir });
+    assert.match(first.stdout, /^feat: 新增接口与工具模块/m);
+    for (const file of ['api/handler.js', 'src/app.js', 'src/util.js']) {
+      assert.ok(first.stdout.includes(file), file);
+    }
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('splits objective files out of a mixed model group', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    const grouped = JSON.stringify({
+      groups: [
+        {
+          files: ['src/app.js', 'src/util.js', 'README.md', 'test/app.test.js'],
+          type: 'feat',
+          message: 'feat: 新增工具模块',
+        },
+        {
+          files: ['package.json', '.github/workflows/ci.yml'],
+          type: 'build',
+          message: 'build: 更新包信息与流水线',
+        },
+      ],
+    });
+    const { api } = makeApi(repo.dir, { llm: fakeLlm(grouped) });
+    const named = await api.name({ sessionId: SESSION });
+
+    const covered = named.plan.groups.flatMap((group) => group.files).sort();
+    assert.equal(new Set(covered).size, 6);
+    // Docs, tests, CI, and build never hide inside a source commit.
+    const readme = named.plan.groups.find((group) => group.files.includes('README.md'));
+    assert.equal(readme.type, 'docs');
+    assert.equal(readme.files.length, 1);
+    const tests = named.plan.groups.find((group) => group.files.includes('test/app.test.js'));
+    assert.equal(tests.type, 'test');
+    const source = named.plan.groups.find((group) => group.message === 'feat: 新增工具模块');
+    assert.deepEqual(source.files, ['src/app.js', 'src/util.js']);
+    assert.match(named.note, /按类型拆成/);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('falls back to rule grouping when even the unit list cannot fit', async () => {
+  const repo = await createRepo();
+  try {
+    for (let index = 0; index < 30; index += 1) {
+      await mkdir(join(repo.dir, `mod-${index}`), { recursive: true });
+      await writeFile(
+        join(repo.dir, `mod-${index}`, 'index.js'),
+        `export const v${index} = ${index};\n`,
+        'utf8',
+      );
+    }
+    // 30 paths and 30 units both outgrow the budget, so the model is not asked.
+    const { api } = makeApi(repo.dir, { config: { maxInputChars: 1000 } });
+    const named = await api.name({ sessionId: SESSION });
+    assert.match(named.note, /改动过多/);
+    assert.match(named.note, /手动调整分组/);
+    assert.equal(named.failures.length, 0);
+    const covered = named.plan.groups.flatMap((group) => group.files).sort();
+    assert.equal(covered.length, 30);
+    for (const message of named.messages) assert.equal(validateMessage(message), null, message);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('plans by rule units when the path list is too long', async () => {
+  const repo = await createRepo();
+  try {
+    await mkdir(join(repo.dir, 'src', 'deep'), { recursive: true });
+    for (let index = 0; index < 40; index += 1) {
+      await writeFile(
+        join(repo.dir, 'src', 'deep', `file-${index}.js`),
+        `export const v${index} = ${index};\n`,
+        'utf8',
+      );
+    }
+    // 40 numbered paths do not fit, but one numbered unit does.
+    const { api } = makeApi(repo.dir, { config: { maxInputChars: 1000 } });
+    const named = await api.name({ sessionId: SESSION });
+    assert.match(named.note, /规则单元/);
+    assert.doesNotMatch(named.note, /改动过多/);
+    assert.equal(named.failures.length, 0);
+    assert.equal(named.plan.groups.length, 1);
+    assert.equal(named.plan.groups[0].files.length, 40);
+    assert.equal(named.plan.groups[0].message, 'refactor: 模型按单元合并');
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('unit input numbers rule buckets and expands back to files', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, maxGroups: 12, timeoutMs: 20000 });
+    const built = await buildUnitGroupingInput(GIT, analysis.plan, {
+      budget: 20000,
+      timeoutMs: 20000,
+      maxGroups: 12,
+    });
+    assert.ok(built !== null);
+    assert.match(built.text, /规则单元/);
+    assert.match(built.text, /^\[1\] /m);
+    assert.equal(built.units.length, 5);
+    const total = built.units.reduce((sum, unit) => sum + unit.files.length, 0);
+    assert.equal(total, 6);
+
+    const expanded = expandUnitGroups(
+      [{ units: [1, 2], type: 'refactor', scope: '', message: 'refactor: 合并前两个单元' }],
+      built.units,
+    );
+    assert.equal(expanded[0].files.length, built.units[0].files.length + built.units[1].files.length);
+    // Out-of-range unit numbers are dropped, never expanded into other files.
+    const bounded = expandUnitGroups([{ units: [1, 99], message: '' }], built.units);
+    assert.deepEqual(bounded[0].files, built.units[0].files);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('fills files the model never claimed with rule groups', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    const grouped = JSON.stringify({
+      groups: [{ files: ['src/app.js'], type: 'feat', message: 'feat: 新增入口文件' }],
+    });
+    const { api } = makeApi(repo.dir, { llm: fakeLlm(grouped) });
+    const named = await api.name({ sessionId: SESSION });
+    const covered = named.plan.groups.flatMap((group) => group.files).sort();
+    assert.equal(covered.length, 6);
+    assert.equal(new Set(covered).size, 6);
+    assert.equal(named.failures.length, 0);
+    assert.ok(named.messages.every((message) => message.trim() !== ''));
+    assert.match(named.note, /模型没有覆盖/);
+    assert.match(named.note, /按规则补成/);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('ignores repeated and out-of-range indices without losing files', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    const grouped = JSON.stringify({
+      groups: [{ paths: [1, 1, 99], type: 'ci', message: 'ci: 调整流水线' }],
+    });
+    const { api } = makeApi(repo.dir, { llm: fakeLlm(grouped) });
+    const named = await api.name({ sessionId: SESSION });
+    const covered = named.plan.groups.flatMap((group) => group.files).sort();
+    assert.equal(new Set(covered).size, 6);
+    assert.equal(named.failures.length, 0);
+    assert.match(named.note, /重复编号/);
+    assert.match(named.note, /越界编号/);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('merges whole types when the model exceeds maxGroups', () => {
+  const entries = [
+    { code: ' M', path: 'a/one.js' },
+    { code: ' M', path: 'b/two.js' },
+    { code: ' M', path: 'c/three.js' },
+    { code: ' M', path: 'docs/x.md' },
+    { code: ' M', path: 'docs/y.md' },
+  ];
+  const plan = {
+    vcs: 'git',
+    cwd: '/tmp',
+    branch: 'main',
+    hasHead: true,
+    staged: [],
+    skipped: [],
+    entries,
+    groups: groupEntries(entries, 99).groups,
+  };
+  const candidates = plan.groups.map((group) => ({
+    paths: group.files,
+    type: group.type,
+    scope: group.scope,
+    message: group.message,
+  }));
+  const applied = applyModelGroups(plan, candidates, { maxGroups: 2 });
+  assert.equal(applied.groups.length, 2);
+  assert.ok(applied.merged > 0);
+  assert.deepEqual(
+    applied.groups.flatMap((group) => group.files).sort(),
+    entries.map((entry) => entry.path).sort(),
+  );
+  for (const group of applied.groups) assert.equal(validateMessage(group.message), null, group.message);
+});
+
+test('planFromSubmitted rejects duplicates, missing paths, and empty groups', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, maxGroups: 12, timeoutMs: 20000 });
+    const plan = publicPlan(analysis.plan);
+
+    const duplicated = { ...plan, groups: [...plan.groups, { ...plan.groups[0] }] };
+    assert.throws(() => planFromSubmitted(duplicated, analysis.plan), (error) => error.code === 'stale');
+
+    const missing = {
+      ...plan,
+      groups: plan.groups
+        .map((group, index) =>
+          index === plan.groups.length - 1 ? { ...group, files: group.files.slice(1) } : group,
+        )
+        .filter((group) => group.files.length > 0),
+    };
+    assert.throws(() => planFromSubmitted(missing, analysis.plan), (error) => error.code === 'stale');
+    assert.throws(() => planFromSubmitted({ ...plan, groups: [] }, analysis.plan), (error) => error.code === 'stale');
+
+    // The rule preview covers the tree, so it is still a valid submission.
+    assert.equal(planFromSubmitted(plan, analysis.plan).length, plan.groups.length);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('extractGroupPlan reads the agreed shape only', () => {
+  const parsed = extractGroupPlan(
+    '```json\n{"groups":[{"paths":[1,2],"type":"feat","scope":"a","message":"feat(a): x"}]}\n```',
+  );
+  assert.equal(parsed.length, 1);
+  assert.deepEqual(parsed[0].paths, [1, 2]);
+  assert.equal(parsed[0].type, 'feat');
+  assert.equal(parsed[0].message, 'feat(a): x');
+  const units = extractGroupPlan('{"groups":[{"units":[1,3],"type":"docs","message":"docs: x"}]}');
+  assert.deepEqual(units[0].units, [1, 3]);
+  assert.equal(extractGroupPlan('{"groups":[]}'), null);
+  assert.equal(extractGroupPlan('no json here'), null);
+  assert.equal(extractGroupPlan('{"messages":["a: b"]}'), null);
 });
 
 test('assertPlanMatches accepts edited messages and rejects a changed grouping', async () => {
@@ -765,17 +1098,35 @@ test('normalizeMessage fixes casing and trailing punctuation only', () => {
   assert.equal(normalizeMessage('没有格式'), '没有格式');
 });
 
-test('model input carries paths, diff text, and the budget', async () => {
+test('grouping input numbers every path, carries diff text, and honors the budget', async () => {
   const repo = await createRepo();
   try {
     await populate(repo.dir);
-    const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, maxGroups: 6, timeoutMs: 20000 });
-    const input = await buildModelInput(GIT, analysis.plan, { budget: 100000, timeoutMs: 20000 });
-    assert.match(input, /共 5 组改动/);
+    const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, maxGroups: 12, timeoutMs: 20000 });
+    const input = await buildGroupingInput(GIT, analysis.plan, {
+      budget: 100000,
+      timeoutMs: 20000,
+      maxGroups: 12,
+    });
+    assert.match(input, /待提交文件：6 个/);
+    assert.match(input, /^1\. /m);
     assert.match(input, /README\.md/);
+    assert.match(input, /\[docs\]/);
     assert.match(input, /^\+更新说明/m);
-    const bounded = await buildModelInput(GIT, analysis.plan, { budget: 200, timeoutMs: 20000 });
-    assert.ok(bounded.length < 1200, `bounded input was ${bounded.length} chars`);
+    assert.match(input, /新文件 src\/app\.js/);
+
+    // The numbering is the contract; when it cannot fit, the rules stay.
+    assert.equal(await buildGroupingInput(GIT, analysis.plan, { budget: 200, timeoutMs: 20000 }), null);
+    const bounded = await buildGroupingInput(GIT, analysis.plan, {
+      budget: 1500,
+      timeoutMs: 20000,
+      maxGroups: 12,
+    });
+    assert.ok(bounded.length < 1800, `bounded input was ${bounded.length} chars`);
+
+    // The repair prompt still describes each group it is asked to rename.
+    const repairInput = await buildModelInput(GIT, analysis.plan, { budget: 100000, timeoutMs: 20000 });
+    assert.match(repairInput, /共 5 组改动/);
   } finally {
     await repo.cleanup();
   }
@@ -818,10 +1169,10 @@ test('config defaults clamp bad values', () => {
   const defaults = resolveConfig(undefined);
   assert.equal(defaults.gitPath, '');
   assert.equal(defaults.timeoutMs, 20000);
-  assert.equal(defaults.maxGroups, 6);
+  assert.equal(defaults.maxGroups, 12);
 
   const custom = resolveConfig({ gitPath: ' /usr/bin/git ', timeoutMs: -1, maxGroups: 0 });
   assert.equal(custom.gitPath, '/usr/bin/git');
   assert.equal(custom.timeoutMs, 20000);
-  assert.equal(custom.maxGroups, 6);
+  assert.equal(custom.maxGroups, 12);
 });

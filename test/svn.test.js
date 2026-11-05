@@ -10,6 +10,7 @@ import { promisify } from 'node:util';
 import {
   analyzeRepo,
   buildModelInput,
+  classify,
   commitPlan,
   createApi,
   publicPlan,
@@ -339,7 +340,7 @@ test('reports a directory that is neither Git nor SVN', async () => {
   }
 });
 
-/** A stub LLM answering with the number of groups the prompt asked for. */
+/** A stub LLM that plays the grouping protocol: cluster the numbered list. */
 function autoLlm() {
   return {
     async resolveModelInfo() {
@@ -350,12 +351,34 @@ function autoLlm() {
         .flatMap((message) => message.content ?? [])
         .map((block) => block.text ?? '')
         .join('\n');
-      const count = Number(/共 (\d+) 组改动/.exec(text)?.[1] ?? 0);
-      const messages = Array.from(
-        { length: count },
-        (_, index) => `refactor(model): 模型生成第 ${index + 1} 条`,
-      );
-      yield { type: 'text-delta', text: JSON.stringify({ messages }) };
+      const unitLines = [...text.matchAll(/^\[(\d+)\] ([a-z-]+)(?:\/[^\s·]+)? · /gmu)];
+      const groups =
+        unitLines.length > 0
+          ? [
+              {
+                units: unitLines.map((match) => Number(match[1])),
+                type: 'refactor',
+                scope: '',
+                message: 'refactor: 模型按单元合并',
+              },
+            ]
+          : (() => {
+              const byType = new Map();
+              for (const line of text.split('\n')) {
+                const match = /^(\d+)\.\s+(.{2})\s+(.*?)(?:\s+\[([a-z]+)\])?$/u.exec(line);
+                if (match === null) continue;
+                const type = match[4] ?? classify(match[3], match[2]);
+                if (!byType.has(type)) byType.set(type, []);
+                byType.get(type).push(Number(match[1]));
+              }
+              return [...byType.entries()].map(([type, paths], position) => ({
+                paths,
+                type,
+                scope: '',
+                message: `${type}: 模型生成第 ${position + 1} 组`,
+              }));
+            })();
+      yield { type: 'text-delta', text: JSON.stringify({ groups }) };
       yield { type: 'finish', reason: { kind: 'stop' } };
     },
   };
