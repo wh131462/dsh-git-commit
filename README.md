@@ -153,6 +153,8 @@ The host does not take the model's word for the risky parts: every number must b
 
 `commit` re-analyzes the working tree and requires the confirmed groups to cover exactly the current changed paths (no duplicates, no omissions, no empty groups); otherwise it returns `stale` without writing. Every message is validated before the first group commits. Git: an empty index check, `git add -- <paths>`, `git commit -F`, and a per-group rollback of its own staging on failure. SVN: `svn add --parents --depth empty` for the group's unversioned files, then `svn commit -F` over the explicit paths (including newly added parent directories); a failure unschedules only that run's adds. The result reports what committed and what is still dirty.
 
+Every git call that meets an `index.lock` first checks whether a process still holds it: a lock left behind by a crashed or timed-out git is cleared and the command retried once, so the commit continues; a lock held by another git process (a terminal commit, an IDE) is never deleted — the holder's PID is reported instead, and you retry once it finishes.
+
 ## Safety rules
 
 - One Angular `type` per commit; `chore` and unknown types are rejected.
@@ -162,6 +164,7 @@ The host does not take the model's word for the risky parts: every number must b
 - A non-empty index aborts the run; the dialog can release exactly the listed paths (the content stays in the working tree).
 - Sensitive files are skipped and reported; a grouping change between confirm and commit is refused.
 - A failed Git group is moved back out of the index so the next attempt starts clean.
+- `index.lock` is only cleared when no process holds it; a live holder is never deleted and its PID is reported instead.
 - SVN conflicts abort before anything is written; missing files are skipped and reported. The plugin never runs `svn update`, `svn resolve`, `--force`, `--amend`, or `--no-verify`.
 - A failed SVN commit reverts only the paths it scheduled itself; file contents always stay on disk.
 - The HTTP channel only accepts same-origin, authenticated, owner-Peer JSON requests; it adds no unauthenticated port and puts no token in the URL.
@@ -174,6 +177,10 @@ The host does not take the model's word for the risky parts: every number must b
 - **Out-of-date commits** are rejected by the server and reported; run `svn update` yourself when you are ready to merge.
 - **Non-ASCII paths and messages.** Every svn command runs under a UTF-8 locale (`C.UTF-8`, falling back to `en_US.UTF-8`), so Chinese or accented paths can be added and committed, and log text reads back as UTF-8 instead of `{U+...}` escapes; svn's own messages stay in English, so parsing is unaffected.
 - **Credentials** are never touched: every command runs `--non-interactive`, so run `svn auth` beforehand if the server prompts.
+
+## Upgrading from 2.0.3
+
+2.1.0 handles `index.lock`: every git call probes whether the lock is still held, clears a lock left by a crashed or timed-out git and retries once, and refuses to delete a lock held by another git process — it reports the PID instead, so an in-flight index write is never corrupted. Configuration keys are unchanged; restart DSH after upgrading.
 
 ## Upgrading from 2.0.2
 
@@ -196,7 +203,7 @@ locale/           plugin metadata (en, zh)
 test/             host and route tests with real temporary git / svn repositories
 ```
 
-The bundle has no runtime dependencies: the host half uses Node built-ins, and the client half gets React from the Harness module table. The tests create real temporary repositories and drive a stub LLM, covering grouping, consolidation without path loss, validation, repair rounds, blocked groups, index release, failed-commit rollback, stale-plan refusal, and the channel's auth, method, and JSON checks; with `svn`/`svnadmin` installed they also run real SVN checkouts, revisions, sensitive-file skipping, add rollback, and non-ASCII paths under the plugin's UTF-8 locale.
+The bundle has no runtime dependencies: the host half uses Node built-ins, and the client half gets React from the Harness module table. The tests create real temporary repositories and drive a stub LLM, covering grouping, consolidation without path loss, validation, repair rounds, blocked groups, index release, failed-commit rollback, orphaned-lock recovery and live-lock refusal, stale-plan refusal, and the channel's auth, method, and JSON checks; with `svn`/`svnadmin` installed they also run real SVN checkouts, revisions, sensitive-file skipping, add rollback, and non-ASCII paths under the plugin's UTF-8 locale.
 
 ## Contributing
 
