@@ -8,9 +8,9 @@
  *
  *   - `analyze` is fast: VCS status plus a rule-based preview grouping.
  *   - `name` is the one slow model call; it decides how many commits the
- *     change set should become (within `maxGroups`), which files belong to
- *     each, and writes one message per commit. It runs after the dialog is
- *     already on screen, so the user sees progress instead of a stuck command.
+ *     change set should become, which files belong to each, and writes one
+ *     message per commit. It runs after the dialog is already on screen, so
+ *     the user sees progress instead of a stuck command.
  *   - `commit` re-reads the working tree, requires the confirmed groups to
  *     cover exactly the changed paths, validates every message, then commits
  *     group by group.
@@ -72,9 +72,6 @@ const DEFAULTS = Object.freeze({
   svnPath: '',
   vcs: 'auto',
   timeoutMs: 20000,
-  // A safety ceiling for the model's own grouping, not a target: the model
-  // picks the count, and whole types are merged only past this many groups.
-  maxGroups: 12,
   useModel: true,
   modelTimeoutMs: 60000,
   maxInputChars: 32000,
@@ -179,7 +176,6 @@ export function resolveConfig(raw) {
         : DEFAULTS.svnPath,
     vcs: ['auto', 'git', 'svn'].includes(source.vcs) ? source.vcs : DEFAULTS.vcs,
     timeoutMs: positive(source.timeoutMs, DEFAULTS.timeoutMs),
-    maxGroups: Math.max(1, Math.round(positive(source.maxGroups, DEFAULTS.maxGroups))),
     useModel: source.useModel !== false,
     modelTimeoutMs: positive(source.modelTimeoutMs, DEFAULTS.modelTimeoutMs),
     maxInputChars: Math.max(1000, Math.round(positive(source.maxInputChars, DEFAULTS.maxInputChars))),
@@ -665,25 +661,13 @@ export function validateMessage(message) {
 }
 
 /**
- * A rule-derived header for a merged group: the rules cannot know the shared
- * theme, so they name the paths (or their areas) instead of counting files.
- * @param type - the Angular type.
- * @param files - the merged group's paths.
- * @returns a header without a scope.
- */
-export function mergedHeaderFor(type, files) {
-  return buildHeader(type, '', subjectFor(type, files));
-}
-
-/**
  * Group collected entries into type+scope units.
- * Over the limit, whole types are consolidated; types are never mixed and no
- * path is ever dropped.
+ * There is no group ceiling: every unit stays its own group, types are never
+ * mixed, and no path is ever dropped.
  * @param entries - classified entries.
- * @param maxGroups - consolidation threshold.
  * @returns `{ groups, skipped }` where skipped are sensitive paths.
  */
-export function groupEntries(entries, maxGroups = DEFAULTS.maxGroups) {
+export function groupEntries(entries) {
   const skipped = [];
   const buckets = new Map();
   for (const entry of entries) {
@@ -703,13 +687,11 @@ export function groupEntries(entries, maxGroups = DEFAULTS.maxGroups) {
     }
     bucket.files.push(entry.path);
   }
-  const groups = consolidateTypes([...buckets.values()], maxGroups);
+  const groups = [...buckets.values()];
 
   for (const group of groups) {
     group.files.sort();
-    if (group.merged !== true) {
-      group.message = buildHeader(group.type, group.scope, subjectFor(group.type, group.files));
-    }
+    group.message = buildHeader(group.type, group.scope, subjectFor(group.type, group.files));
     if (validateMessage(group.message) !== null) {
       group.message = heuristicHeader(group.type, group.scope, group.files);
     }
@@ -719,48 +701,6 @@ export function groupEntries(entries, maxGroups = DEFAULTS.maxGroups) {
   }
   groups.sort((left, right) => left.message.localeCompare(right.message));
   return { groups, skipped };
-}
-
-/**
- * Merge whole types until the group count fits: a merged group drops its
- * scope so its message can describe the whole type honestly, and no path is
- * ever dropped or moved into a different type.
- *
- * @param groups - candidate groups; they are not mutated.
- * @param maxGroups - the ceiling.
- * @returns the same groups, plus heuristic messages for any merged ones.
- */
-export function consolidateTypes(groups, maxGroups = DEFAULTS.maxGroups) {
-  let current = [...groups];
-  while (current.length > maxGroups) {
-    const byType = new Map();
-    for (const group of current) {
-      let entry = byType.get(group.type);
-      if (entry === undefined) {
-        entry = { count: 0, files: [] };
-        byType.set(group.type, entry);
-      }
-      entry.count += 1;
-      entry.files.push(...group.files);
-    }
-    let target;
-    for (const [type, entry] of byType) {
-      if (entry.count > 1 && (target === undefined || entry.count > target.count)) {
-        target = { type, files: entry.files };
-      }
-    }
-    if (target === undefined) break; // One group per type: keep the detail.
-    current = current.filter((group) => group.type !== target.type);
-    target.files.sort();
-    current.push({
-      type: target.type,
-      scope: '',
-      merged: true,
-      files: target.files,
-      message: mergedHeaderFor(target.type, target.files),
-    });
-  }
-  return current;
 }
 
 /**
@@ -835,7 +775,7 @@ export async function analyzeRepo(options) {
  * @param options - git binary, repository directory, limits.
  * @returns a plan, or a failure description.
  */
-async function analyzeGitRepo({ gitBin, cwd, maxGroups, timeoutMs }) {
+async function analyzeGitRepo({ gitBin, cwd, timeoutMs }) {
   const top = await runGit(gitBin, cwd, ['rev-parse', '--show-toplevel'], { timeoutMs });
   if (top.code !== 0) {
     return { ok: false, notRepo: true, text: '当前目录不是 Git 仓库，未做任何改动。' };
@@ -859,7 +799,7 @@ async function analyzeGitRepo({ gitBin, cwd, maxGroups, timeoutMs }) {
   if (entries.length === 0) {
     return { ok: false, clean: true, text: '工作区干净，没有可提交的改动。' };
   }
-  const { groups, skipped } = groupEntries(entries, maxGroups);
+  const { groups, skipped } = groupEntries(entries);
   if (groups.length === 0) {
     return { ok: false, clean: true, text: '只剩敏感文件，已全部跳过，没有可提交的内容。' };
   }
@@ -896,7 +836,7 @@ async function analyzeGitRepo({ gitBin, cwd, maxGroups, timeoutMs }) {
  * @param options - svn binary, directory, limits.
  * @returns a plan, or a failure description.
  */
-async function analyzeSvnRepo({ svnBin, cwd, maxGroups, timeoutMs }) {
+async function analyzeSvnRepo({ svnBin, cwd, timeoutMs }) {
   const bin = svnBin ?? resolveSvn('');
   const info = await svnInfo(bin, cwd, timeoutMs);
   if (!info.ok) {
@@ -918,7 +858,7 @@ async function analyzeSvnRepo({ svnBin, cwd, maxGroups, timeoutMs }) {
   if (status.entries.length === 0) {
     return { ok: false, clean: true, text: '工作区干净，没有可提交的改动。' };
   }
-  const { groups, skipped } = groupEntries(status.entries, maxGroups);
+  const { groups, skipped } = groupEntries(status.entries);
   if (groups.length === 0) {
     return { ok: false, clean: true, text: '只剩敏感文件，已全部跳过，没有可提交的内容。' };
   }
@@ -1116,10 +1056,10 @@ export async function buildModelInput(bin, plan, { budget, timeoutMs }) {
  *
  * @param bin - git or svn executable, matching `plan.vcs`.
  * @param plan - the analyzed plan (its groups define the path set).
- * @param options - character budget, command timeout, and the group ceiling.
+ * @param options - character budget and command timeout.
  * @returns the prompt body, or `null` when the file list is too large.
  */
-export async function buildGroupingInput(bin, plan, { budget, timeoutMs, maxGroups = DEFAULTS.maxGroups }) {
+export async function buildGroupingInput(bin, plan, { budget, timeoutMs }) {
   const files = planFiles(plan);
   if (files.length === 0) return null;
   const codes = entryCodes(plan);
@@ -1134,7 +1074,7 @@ export async function buildGroupingInput(bin, plan, { budget, timeoutMs, maxGrou
   const preface = [
     `仓库：${plan.cwd}${plan.vcs === 'svn' ? '（SVN）' : ''}`,
     `分支：${plan.hasHead === false ? '无提交历史' : plan.branch}`,
-    `待提交文件：${files.length} 个；最多分 ${maxGroups} 组。`,
+    `待提交文件：${files.length} 个；组数由你按改动主题决定。`,
   ].join('\n');
   if (numbering.length > budget * 0.6) return null;
   const remaining = Math.max(0, budget - preface.length - numbering.length);
@@ -1145,14 +1085,14 @@ export async function buildGroupingInput(bin, plan, { budget, timeoutMs, maxGrou
 
 /**
  * The rule buckets the unit plan numbers: one type+scope unit per entry.
- * A unit cannot be split by the model; it can only be merged with others.
+ * A unit cannot be split by the model; it can only be merged with other units.
  *
  * @param plan - the analyzed plan.
  * @returns `[{ type, scope, files }]`.
  */
 export function planUnits(plan) {
   const fromEntries = Array.isArray(plan.entries) && plan.entries.length > 0
-    ? groupEntries(plan.entries, Number.MAX_SAFE_INTEGER).groups
+    ? groupEntries(plan.entries).groups
     : plan.groups;
   return fromEntries.map((group) => ({
     type: group.type,
@@ -1170,10 +1110,10 @@ export function planUnits(plan) {
  *
  * @param bin - git or svn executable, matching `plan.vcs`.
  * @param plan - the analyzed plan.
- * @param options - character budget, command timeout, and the group ceiling.
+ * @param options - character budget and command timeout.
  * @returns `{ units, text }`, or `null` when the unit list is too large.
  */
-export async function buildUnitGroupingInput(bin, plan, { budget, timeoutMs, maxGroups = DEFAULTS.maxGroups } = {}) {
+export async function buildUnitGroupingInput(bin, plan, { budget, timeoutMs } = {}) {
   const units = planUnits(plan);
   if (units.length === 0) return null;
   const lines = units.map((unit, index) => {
@@ -1186,7 +1126,7 @@ export async function buildUnitGroupingInput(bin, plan, { budget, timeoutMs, max
   const preface = [
     `仓库：${plan.cwd}${plan.vcs === 'svn' ? '（SVN）' : ''}`,
     `分支：${plan.hasHead === false ? '无提交历史' : plan.branch}`,
-    `待提交文件：${planFiles(plan).length} 个，归为 ${units.length} 个规则单元；最多分 ${maxGroups} 组。`,
+    `待提交文件：${planFiles(plan).length} 个，归为 ${units.length} 个规则单元；组数由你按改动主题决定。`,
   ].join('\n');
   if (numbering.length > budget * 0.7) return null;
   const remaining = Math.max(0, budget - preface.length - numbering.length);
@@ -1201,7 +1141,7 @@ export async function buildUnitGroupingInput(bin, plan, { budget, timeoutMs, max
 
 /**
  * Turn unit-numbered candidates into file-numbered ones so the same validation
- * (coverage, objective split, ceiling, messages) can run over them.
+ * (coverage, objective split, messages) can run over them.
  * @param candidates - groups parsed from the model reply.
  * @param units - the numbered units the prompt described.
  * @returns candidates whose `files` are expanded paths.
@@ -1405,13 +1345,11 @@ function splitObjective(files, codes) {
  * Rule-name a set of paths as its own groups.
  * @param files - paths of one objective class.
  * @param codes - status code by path.
- * @param maxGroups - the ceiling.
  * @returns groups carrying a rule-derived message.
  */
-function ruleGroupsFor(files, codes, maxGroups) {
+function ruleGroupsFor(files, codes) {
   const groups = groupEntries(
     files.map((path) => ({ path, code: codes.get(path) ?? '' })),
-    maxGroups,
   ).groups;
   for (const group of groups) {
     group.suggestion = group.message;
@@ -1426,14 +1364,13 @@ function ruleGroupsFor(files, codes, maxGroups) {
  * The model may not lose files: paths it never claimed are grouped by the
  * rules and appended (with a rule-derived message), repeated or out-of-range
  * numbers are ignored, objective types are never mixed into a code commit,
- * and only a count above `maxGroups` triggers a merge.
+ * and there is no group ceiling: every group the model names is kept.
  *
  * @param plan - the analyzed plan; its groups define the path set.
  * @param candidates - groups parsed from the model reply.
- * @param options - the group ceiling.
  * @returns the final groups, per-group message failures, and coverage stats.
  */
-export function applyModelGroups(plan, candidates, { maxGroups = DEFAULTS.maxGroups } = {}) {
+export function applyModelGroups(plan, candidates) {
   const files = planFiles(plan);
   const codes = entryCodes(plan);
   const pathIndex = new Map(files.map((file, index) => [file, index]));
@@ -1481,7 +1418,7 @@ export function applyModelGroups(plan, candidates, { maxGroups = DEFAULTS.maxGro
     }
     if (source.length > 0) modelGroups.push(buildModelGroup(source, candidate, codes));
     for (const classFiles of objective.values()) {
-      const groups = ruleGroupsFor(classFiles, codes, maxGroups);
+      const groups = ruleGroupsFor(classFiles, codes);
       splitFiles += classFiles.length;
       splitGroups += groups.length;
       filled.push(...groups);
@@ -1490,18 +1427,12 @@ export function applyModelGroups(plan, candidates, { maxGroups = DEFAULTS.maxGro
 
   const leftovers = files.filter((_file, index) => claimed[index] === false);
   if (leftovers.length > 0) {
-    filled.push(...ruleGroupsFor(leftovers, codes, maxGroups));
+    filled.push(...ruleGroupsFor(leftovers, codes));
   }
 
-  const before = modelGroups.length + filled.length;
-  const groups = consolidateTypes([...modelGroups, ...filled], maxGroups);
+  const groups = [...modelGroups, ...filled];
   const failures = [];
   groups.forEach((group, index) => {
-    if (group.merged === true) {
-      group.suggestion = group.message;
-      delete group.failure;
-      return;
-    }
     if (typeof group.failure === 'string') failures.push({ index, reason: group.failure });
   });
 
@@ -1512,7 +1443,6 @@ export function applyModelGroups(plan, candidates, { maxGroups = DEFAULTS.maxGro
     filled: filled.length,
     splitFiles,
     splitGroups,
-    merged: before - groups.length,
     duplicated,
     dropped,
   };
@@ -1923,7 +1853,6 @@ async function namePlan(ctx, config, plan, { signal, sessionId, route, gitBin, s
     const budget = {
       budget: config.maxInputChars,
       timeoutMs: config.timeoutMs,
-      maxGroups: config.maxGroups,
     };
     let input = await buildGroupingInput(modelBin, plan, budget);
     let mode = 'files';
@@ -1962,7 +1891,7 @@ async function namePlan(ctx, config, plan, { signal, sessionId, route, gitBin, s
     if (parsed === null) throw new Error('模型输出不是约定的 JSON');
     const candidates = mode === 'units' ? expandUnitGroups(parsed, unitPlan) : parsed;
 
-    const applied = applyModelGroups(plan, candidates, { maxGroups: config.maxGroups });
+    const applied = applyModelGroups(plan, candidates);
     const groups = applied.groups;
 
     /**
@@ -1972,7 +1901,7 @@ async function namePlan(ctx, config, plan, { signal, sessionId, route, gitBin, s
      * actual change before that placeholder can be committed.
      */
     const ruleNamed = new Set(
-      groups.flatMap((group, index) => (group.filled === true || group.merged === true ? [index] : [])),
+      groups.flatMap((group, index) => (group.filled === true ? [index] : [])),
     );
     const placeholderReason = '这一组只有按路径生成的占位 message，需要写清这组文件具体改了什么';
     let pending = [
@@ -2038,9 +1967,6 @@ async function namePlan(ctx, config, plan, { signal, sessionId, route, gitBin, s
         `${applied.splitFiles} 个文档/测试/CI/构建文件被模型和别的类型放进同一组，已按类型拆成 ${applied.splitGroups} 组`,
       );
     }
-    if (applied.merged > 0) {
-      coverage.push(`超过上限 ${config.maxGroups} 组，已按 type 合并 ${applied.merged} 组`);
-    }
     if (applied.duplicated > 0 || applied.dropped > 0) {
       coverage.push(`${applied.duplicated} 个重复编号、${applied.dropped} 个越界编号已忽略`);
     }
@@ -2100,7 +2026,6 @@ export function createApi(ctx, config) {
       ...binaries,
       vcs: config.vcs,
       cwd: target.cwd,
-      maxGroups: config.maxGroups,
       timeoutMs: config.timeoutMs,
     });
     if (!analysis.ok) {
