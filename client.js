@@ -29,7 +29,7 @@ window.__ModuleLoader__.load({
       'action.noSession': 'Open a session first.',
       'action.title': 'Let the current model decide the commit groups and name each of them.',
       'dialog.title': 'Confirm commit',
-      'dialog.hint': 'The model picks the groups; messages are editable and the host validates them.',
+      'dialog.hint': 'Model groups; messages editable; the host validates.',
       'dialog.cancel': 'Cancel',
       'dialog.confirm': 'Commit',
       'dialog.committing': 'Committing\u2026',
@@ -44,8 +44,7 @@ window.__ModuleLoader__.load({
       'dialog.more': '+{n} more',
       'dialog.collapse': 'Show less',
       'dialog.selected': '{n} files selected',
-      'dialog.moveTo': 'Move selected files to',
-      'dialog.move': 'Move',
+      'dialog.moveTo': 'Move to',
       'dialog.clearSelection': 'Clear selection',
       'dialog.newGroup': 'New group',
       'dialog.groupN': 'Group {n}',
@@ -53,12 +52,11 @@ window.__ModuleLoader__.load({
       'dialog.edited': 'Grouping changed',
       'dialog.selectGroup': 'Select all {n}',
       'dialog.clearGroup': 'Deselect group',
-      'dialog.regroupHint':
-        'Drag a file onto another group, or select files and move them together (Shift-click extends the selection).',
+      'dialog.regroupHint': 'Drag files between groups, or select and move them; Shift-click extends the selection.',
       'dialog.closeLabel': 'Close dialog',
       'dialog.svnNote':
         'SVN working copy: commits use explicit paths, one revision per group. There is no staging area.',
-      'dialog.summary': '{groups} groups / {files} files \u00b7 {branch} \u00b7 {vcs}',
+      'dialog.summary': '{groups} groups, {files} files',
       'dialog.missing': '{n} groups still need a message.',
       'dialog.needUnstage': 'Tick the unstage box before committing.',
       'dialog.modelMissing': 'The model did not name this group: {reason}',
@@ -78,7 +76,7 @@ window.__ModuleLoader__.load({
       'action.noSession': '先打开一个会话。',
       'action.title': '由当前模型决定分几组，并为每组生成 message。',
       'dialog.title': '确认提交',
-      'dialog.hint': '分组由模型给出，message 可以直接改，提交前由 Host 校验。',
+      'dialog.hint': '分组由模型给出，message 可改，提交前统一校验。',
       'dialog.cancel': '取消',
       'dialog.confirm': '确认提交',
       'dialog.committing': '提交中\u2026',
@@ -93,8 +91,7 @@ window.__ModuleLoader__.load({
       'dialog.more': '等 {n} 个',
       'dialog.collapse': '收起',
       'dialog.selected': '已选 {n} 个文件',
-      'dialog.moveTo': '把选中的文件移到',
-      'dialog.move': '移动',
+      'dialog.moveTo': '移动到',
       'dialog.clearSelection': '取消选择',
       'dialog.newGroup': '新建分组',
       'dialog.groupN': '第 {n} 组',
@@ -102,11 +99,10 @@ window.__ModuleLoader__.load({
       'dialog.edited': '分组已调整',
       'dialog.selectGroup': '全选 {n} 个',
       'dialog.clearGroup': '取消本组',
-      'dialog.regroupHint':
-        '可以把文件拖到别的分组，也可以点选多个文件后统一移动；Shift 点击连选，或直接全选本组。',
+      'dialog.regroupHint': '把文件拖到目标分组，或多选后统一移动；Shift 点击连选。',
       'dialog.closeLabel': '关闭弹窗',
       'dialog.svnNote': 'SVN 工作副本：按路径提交，每组一个 revision；没有暂存区。',
-      'dialog.summary': '{groups} 组 / {files} 个文件 \u00b7 {branch} \u00b7 {vcs}',
+      'dialog.summary': '{groups} 组，{files} 个文件',
       'dialog.missing': '还有 {n} 组没有 message。',
       'dialog.needUnstage': '先勾选「先取消暂存」才能提交。',
       'dialog.modelMissing': '这一组没有生成 message：{reason}',
@@ -328,7 +324,7 @@ window.__ModuleLoader__.load({
           ? dialog.selected.filter((item) => item !== path)
           : [...dialog.selected, path];
       }
-      store.dialog = { ...dialog, selected, lastPicked: { groupId, path }, error: '', messageErrors: [] };
+      store.dialog = { ...dialog, selected, lastPicked: { groupId, path } };
       emit();
     }
 
@@ -341,7 +337,7 @@ window.__ModuleLoader__.load({
       const selected = all
         ? dialog.selected.filter((file) => !files.has(file))
         : [...new Set([...dialog.selected, ...group.files])];
-      store.dialog = { ...dialog, selected, lastPicked: null, error: '', messageErrors: [] };
+      store.dialog = { ...dialog, selected, lastPicked: null };
       emit();
     }
 
@@ -406,6 +402,7 @@ window.__ModuleLoader__.load({
       const kept = groups.filter((group) => group.files.length > 0);
       store.dialog = {
         ...dialog,
+        moveMenu: false,
         plan: { ...dialog.plan, groups: kept },
         selected: dialog.selected.filter((path) => !moving.has(path)),
         expanded: dialog.expanded.filter((id) => kept.some((group) => group.id === id)),
@@ -420,6 +417,7 @@ window.__ModuleLoader__.load({
     function moveSelected(targetId) {
       const dialog = store.dialog;
       if (dialog === null) return;
+      store.dialog = { ...dialog, moveMenu: false };
       moveFiles([...dialog.selected], targetId);
     }
 
@@ -486,7 +484,6 @@ window.__ModuleLoader__.load({
         selected: [],
         expanded: [],
         overId: '',
-        moveTarget: 'new',
         lastPicked: null,
       };
       emit();
@@ -531,8 +528,7 @@ window.__ModuleLoader__.load({
             selected: [],
             expanded: [],
             overId: '',
-            moveTarget: 'new',
-          };
+              };
         } catch (error) {
           if (controller.signal.aborted) return;
           if (!isCurrent(requestId)) return;
@@ -563,7 +559,6 @@ window.__ModuleLoader__.load({
         selected: [],
         expanded: [],
         overId: '',
-        moveTarget: 'new',
       };
       emit();
       try {
@@ -581,8 +576,7 @@ window.__ModuleLoader__.load({
           selected: [],
           expanded: [],
           overId: '',
-          moveTarget: 'new',
-        };
+          };
       } catch (error) {
         if (controller.signal.aborted) return;
         if (!isCurrent(requestId)) return;
@@ -611,7 +605,7 @@ window.__ModuleLoader__.load({
       if (messages.some((message) => message.trim() === '')) return;
       if (dialog.plan.staged.length > 0 && dialog.unstage !== true) return;
 
-      store.dialog = { ...dialog, phase: 'committing', error: '', messageErrors: [] };
+      store.dialog = { ...dialog, phase: 'committing', error: '', messageErrors: [], moveMenu: false };
       emit();
       try {
         const result = await call(
@@ -645,6 +639,7 @@ window.__ModuleLoader__.load({
         store.dialog = {
           ...store.dialog,
           phase: 'edit',
+          moveMenu: false,
           error: error.message,
           messageErrors: groups,
           stale: error.code === 'stale',
@@ -692,57 +687,85 @@ window.__ModuleLoader__.load({
       // Spinner + progress.
       '.dsh-sc-spinner{width:11px;height:11px;flex:none;border:1.5px solid color-mix(in srgb, var(--dsw-alias-brand-primary) 25%, transparent);border-top-color:var(--dsw-alias-brand-primary);border-radius:50%;animation:dsh-sc-spin .75s linear infinite;}',
       '@keyframes dsh-sc-spin{to{transform:rotate(360deg);}}',
-      '.dsh-sc-progress{display:flex;align-items:center;gap:8px;margin:2px 0 10px;padding:8px 10px;border-radius:8px;background:color-mix(in srgb, var(--dsw-alias-brand-primary) 8%, transparent);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;}',
+      '.dsh-sc-progress{display:flex;align-items:center;gap:8px;margin:2px 0 12px;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;}',
       '.dsh-sc-progress-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       // Overlay + dialog.
       '.dsh-sc-backdrop{position:fixed;inset:0;z-index:9000;display:flex;align-items:center;justify-content:center;padding:24px;pointer-events:auto;background:color-mix(in srgb, var(--dsw-alias-bg-base) 58%, transparent);}',
-      '.dsh-sc-dialog{display:flex;flex-direction:column;width:min(700px,100%);max-height:min(82vh,760px);border:1px solid var(--dsw-alias-border-l2);border-radius:14px;background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);box-shadow:0 18px 48px color-mix(in srgb, var(--dsw-alias-label-primary) 16%, transparent);overflow:hidden;}',
-      '.dsh-sc-head{display:flex;align-items:flex-start;gap:12px;padding:16px 18px 10px;}',
-      '.dsh-sc-head-text{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1;}',
+      '.dsh-sc-dialog{position:relative;display:flex;flex-direction:column;width:min(680px,100%);max-height:min(82vh,760px);border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);box-shadow:0 16px 40px color-mix(in srgb, var(--dsw-alias-label-primary) 14%, transparent);overflow:hidden;}',
+      '.dsh-sc-head{display:flex;align-items:flex-start;gap:12px;padding:16px 20px 12px;}',
+      '.dsh-sc-head-text{display:flex;flex-direction:column;gap:4px;min-width:0;flex:1;}',
       '.dsh-sc-title{font-size:14px;font-weight:600;line-height:20px;}',
-      '.dsh-sc-sub{font-size:12px;line-height:17px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
-      '.dsh-sc-x{flex:none;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:16px;line-height:1;cursor:pointer;}',
+      '.dsh-sc-subrow{display:flex;align-items:center;gap:10px;min-width:0;}',
+      '.dsh-sc-sub{min-width:0;flex:0 1 auto;font-size:12px;line-height:17px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+      '.dsh-sc-branch{min-width:0;max-width:220px;flex:0 1 auto;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+      '.dsh-sc-vcs{flex:none;padding:0 5px;border:1px solid var(--dsw-alias-border-l1);border-radius:4px;color:var(--dsw-alias-label-secondary);font-size:10px;line-height:14px;letter-spacing:.04em;}',
+      '.dsh-sc-x{flex:none;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:16px;line-height:1;cursor:pointer;}',
       '.dsh-sc-x:hover{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);}',
       '.dsh-sc-x:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-1px;}',
-      '.dsh-sc-body{flex:1;min-height:0;overflow:auto;padding:2px 18px 8px;}',
-      '.dsh-sc-group{display:flex;flex-direction:column;gap:5px;margin:2px 0;padding:8px 8px 9px;border:1px solid transparent;border-radius:10px;transition:border-color .12s ease,background-color .12s ease;}',
-      '.dsh-sc-group:hover{background:var(--dsw-alias-bg-layer-1);}',
-      '.dsh-sc-group[data-over="true"]{border-color:var(--dsw-alias-brand-primary);background:color-mix(in srgb, var(--dsw-alias-brand-primary) 8%, transparent);}',
-      '.dsh-sc-group-head{display:flex;align-items:flex-start;gap:6px;}',
-      '.dsh-sc-idx{width:18px;flex:none;padding-top:5px;text-align:right;color:var(--dsw-alias-label-secondary);font-size:11px;font-variant-numeric:tabular-nums;}',
-      '.dsh-sc-tool{flex:none;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;margin-top:2px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:1;cursor:pointer;}',
-      '.dsh-sc-tool:hover{background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);}',
+      '.dsh-sc-body{flex:1;min-height:0;overflow:auto;padding:0 20px 6px;}',
+      '.dsh-sc-group{display:flex;flex-direction:column;gap:6px;margin:0 -8px;padding:9px 8px;border:0;border-radius:8px;transition:background-color .12s ease;}',
+      '.dsh-sc-group[data-over="true"]{background:color-mix(in srgb, var(--dsw-alias-brand-primary) 7%, transparent);box-shadow:inset 0 0 0 1px var(--dsw-alias-brand-primary);}',
+      '.dsh-sc-group-head{display:flex;align-items:flex-start;gap:8px;}',
+      '.dsh-sc-idx{width:16px;flex:none;padding-top:6px;text-align:right;color:var(--dsw-alias-label-secondary);font-size:10px;font-variant-numeric:tabular-nums;}',
+      '.dsh-sc-tool{flex:none;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;margin-top:2px;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:1;cursor:pointer;}',
+      '.dsh-sc-tool:hover{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);}',
       '.dsh-sc-tool:disabled{opacity:.5;cursor:progress;}',
-      '.dsh-sc-chips{display:flex;flex-wrap:wrap;gap:4px;padding-left:24px;}',
-      '.dsh-sc-chip{max-width:100%;padding:1px 7px;border:1px solid var(--dsw-alias-border-l1);border-radius:999px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:16px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
-      '.dsh-sc-chip:hover{color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l2);}',
-      '.dsh-sc-chip[data-selected="true"]{border-color:var(--dsw-alias-brand-primary);background:color-mix(in srgb, var(--dsw-alias-brand-primary) 10%, transparent);color:var(--dsw-alias-brand-primary);}',
+      '.dsh-sc-chips{display:flex;flex-wrap:wrap;gap:5px;padding-left:24px;}',
+      '.dsh-sc-chip{max-width:100%;padding:1px 6px;border:0;border-radius:4px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:17px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+      '.dsh-sc-chip:hover{background:color-mix(in srgb, var(--dsw-alias-label-primary) 8%, transparent);color:var(--dsw-alias-label-primary);}',
+      '.dsh-sc-chip[data-selected="true"]{background:color-mix(in srgb, var(--dsw-alias-brand-primary) 18%, transparent);box-shadow:inset 0 0 0 1px var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary);}',
       '.dsh-sc-chip:disabled{cursor:progress;opacity:.7;}',
-      '.dsh-sc-chip-more{border-style:dashed;}',
-      '.dsh-sc-tag{flex:none;padding:0 6px;border-radius:999px;background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 14%, transparent);color:var(--dsw-alias-state-warn-primary);}',
-      '.dsh-sc-selectbar{position:sticky;top:0;z-index:2;display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:0 0 6px;padding:7px 9px;border-radius:8px;background:color-mix(in srgb, var(--dsw-alias-brand-primary) 10%, var(--dsw-alias-bg-overlay));}',
-      '.dsh-sc-selectbar-count{font-size:11px;color:var(--dsw-alias-label-secondary);}',
-      '.dsh-sc-select{height:24px;max-width:180px;padding:0 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:11px;}',
-      '.dsh-sc-mini{height:24px;padding:0 10px;font-size:11px;}',
-      '.dsh-sc-field{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px;}',
-      '.dsh-sc-input{width:100%;box-sizing:border-box;min-height:28px;padding:4px 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;line-height:18px;resize:none;overflow:hidden;}',
+      '.dsh-sc-chip-more{background:transparent;}',
+      '.dsh-sc-gsel{flex:none;display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;padding:0;border:1px solid var(--dsw-alias-border-l1);border-radius:4px;background:transparent;color:transparent;font:inherit;font-size:11px;line-height:1;cursor:pointer;}',
+      '.dsh-sc-gsel:hover{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary);}',
+      '.dsh-sc-gsel[data-checked="true"]{border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-overlay);}',
+      '.dsh-sc-gsel:disabled{opacity:.5;cursor:progress;}',
+      '.dsh-sc-chips[data-selecting="true"] .dsh-sc-chip:not([data-selected="true"]):not(.dsh-sc-chip-more){opacity:.6;}',
+      '.dsh-sc-chips[data-selecting="true"] .dsh-sc-chip:not([data-selected="true"]):not(.dsh-sc-chip-more):hover{opacity:1;}',
+      '.dsh-sc-chips[data-selecting="true"] .dsh-sc-chip:not([data-selected="true"]):not(.dsh-sc-chip-more):focus-visible{opacity:1;}',
+      '.dsh-sc-tag{flex:none;padding:0 5px;border-radius:4px;background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 12%, transparent);color:var(--dsw-alias-state-warn-primary);}',
+      '.dsh-sc-selbar{display:flex;align-items:center;gap:6px;min-width:0;margin-right:auto;}',
+      '.dsh-sc-selcount{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--dsw-alias-label-secondary);}',
+      '.dsh-sc-dropdown{position:relative;flex:none;}',
+      '.dsh-sc-moveto{display:inline-flex;align-items:center;gap:4px;height:24px;padding:0 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:4px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:11px;line-height:22px;white-space:nowrap;cursor:pointer;}',
+      '.dsh-sc-moveto:hover{background:var(--dsw-alias-bg-layer-1);}',
+      '.dsh-sc-moveto:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px;}',
+      '.dsh-sc-caret{width:0;height:0;border-left:3.5px solid transparent;border-right:3.5px solid transparent;border-top:4px solid currentColor;opacity:.65;}',
+      '.dsh-sc-clear{flex:none;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:14px;line-height:1;cursor:pointer;}',
+      '.dsh-sc-clear:hover{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);}',
+      '.dsh-sc-clear:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px;}',
+      '.dsh-sc-scrim{position:fixed;inset:0;z-index:4;background:transparent;}',
+      '.dsh-sc-menu{position:absolute;left:0;bottom:calc(100% + 6px);z-index:5;min-width:180px;max-height:min(220px,40vh);overflow:auto;padding:4px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-overlay);box-shadow:0 10px 28px color-mix(in srgb, var(--dsw-alias-label-primary) 18%, transparent);}',
+      '.dsh-sc-menu-item{display:flex;align-items:center;justify-content:space-between;gap:12px;width:100%;height:26px;padding:0 8px;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:11px;line-height:1;text-align:left;cursor:pointer;}',
+      '.dsh-sc-menu-item:hover{background:var(--dsw-alias-bg-layer-1);}',
+      '.dsh-sc-menu-item:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px;}',
+      '.dsh-sc-menu-count{flex:none;color:var(--dsw-alias-label-secondary);font-size:10px;}',
+      '.dsh-sc-menu-sep{height:1px;margin:4px 2px;background:var(--dsw-alias-border-l1);}',
+      '@media (max-width:560px){.dsh-sc-selcount{display:none;}}',
+      '.dsh-sc-field{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px;}',
+      '.dsh-sc-input{width:100%;box-sizing:border-box;min-height:28px;padding:5px 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;line-height:18px;resize:none;overflow:hidden;}',
       '.dsh-sc-input:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-1px;}',
       '.dsh-sc-input:disabled{opacity:.72;cursor:progress;}',
       '.dsh-sc-input[data-loading="true"]{border-style:dashed;}',
-      '.dsh-sc-meta{display:flex;align-items:center;gap:8px;font-size:11px;line-height:15px;color:var(--dsw-alias-label-secondary);}',
+      '.dsh-sc-meta{display:flex;align-items:center;gap:6px;font-size:11px;line-height:15px;color:var(--dsw-alias-label-secondary);}',
       '.dsh-sc-count{flex:none;}',
       '.dsh-sc-line{margin-top:1px;font-size:11px;line-height:15px;}',
       '.dsh-sc-line[data-kind="warn"]{color:var(--dsw-alias-state-warn-primary);}',
       '.dsh-sc-line[data-kind="error"]{color:var(--dsw-alias-state-error-primary);}',
-      '.dsh-sc-warn{margin:8px 0 0;padding:8px 10px;border-radius:8px;background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 12%, transparent);color:var(--dsw-alias-state-warn-primary);font-size:11px;line-height:16px;}',
+      '.dsh-sc-warn{margin:8px 0 0;padding:7px 9px;border-radius:6px;background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 8%, transparent);color:var(--dsw-alias-state-warn-primary);font-size:11px;line-height:16px;}',
       '.dsh-sc-warn-paths{margin-top:4px;max-height:84px;overflow:auto;white-space:pre-wrap;word-break:break-all;font-family:inherit;opacity:.9;}',
       '.dsh-sc-check{display:flex;align-items:center;gap:6px;margin-top:8px;cursor:pointer;}',
+      '.dsh-sc-check input{appearance:none;-webkit-appearance:none;position:relative;flex:none;width:14px;height:14px;margin:0;border:1px solid var(--dsw-alias-border-l1);border-radius:3px;background:var(--dsw-alias-bg-base);cursor:pointer;}',
+      '.dsh-sc-check input:checked{border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-brand-primary);}',
+      '.dsh-sc-check input:checked::after{content:"";position:absolute;left:3px;top:1px;width:4px;height:7px;border:solid var(--dsw-alias-bg-overlay);border-width:0 1.5px 1.5px 0;transform:rotate(45deg);}',
+      '.dsh-sc-check input:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px;}',
+      '.dsh-sc-check input:disabled{opacity:.6;cursor:progress;}',
       '.dsh-sc-note{margin-top:8px;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);}',
-      '.dsh-sc-pre{margin:6px 0 0;padding:10px 12px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;line-height:18px;white-space:pre-wrap;word-break:break-word;}',
+      '.dsh-sc-pre{margin:6px 0 0;padding:10px 12px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;line-height:18px;white-space:pre-wrap;word-break:break-word;}',
       '.dsh-sc-error{color:var(--dsw-alias-state-error-primary);}',
-      '.dsh-sc-foot{display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:12px 18px;border-top:1px solid var(--dsw-alias-border-l1);}',
+      '.dsh-sc-foot{display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:12px 20px;border-top:1px solid var(--dsw-alias-border-l1);}',
       '.dsh-sc-foot-hint{margin-right:auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--dsw-alias-label-secondary);}',
-      '.dsh-sc-primary,.dsh-sc-ghost{height:28px;padding:0 14px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1);font:inherit;font-size:12px;cursor:pointer;flex:none;}',
+      '.dsh-sc-primary,.dsh-sc-ghost{height:28px;padding:0 14px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);font:inherit;font-size:12px;cursor:pointer;flex:none;}',
       '.dsh-sc-primary{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base);}',
       '.dsh-sc-primary:disabled{opacity:.6;cursor:progress;}',
       '.dsh-sc-ghost{background:transparent;color:var(--dsw-alias-label-secondary);}',
@@ -875,6 +898,8 @@ window.__ModuleLoader__.load({
         const dialogRef = React.useRef(null);
         const phaseRef = React.useRef('edit');
         phaseRef.current = dialog?.phase ?? 'edit';
+        const menuRef = React.useRef(false);
+        menuRef.current = dialog?.moveMenu === true;
 
         const close = () => {
           if (phaseRef.current === 'committing') return;
@@ -885,7 +910,17 @@ window.__ModuleLoader__.load({
           if (dialog === null) return undefined;
           const previous = document.activeElement;
           const onKey = (event) => {
-            if (event.key === 'Escape' && phaseRef.current !== 'committing') {
+            if (event.key !== 'Escape') return;
+            if (menuRef.current) {
+              // Escape closes only the target menu; the dialog stays open.
+              event.stopPropagation();
+              if (store.dialog !== null) {
+                store.dialog = { ...store.dialog, moveMenu: false };
+                emit();
+              }
+              return;
+            }
+            if (phaseRef.current !== 'committing') {
               event.stopPropagation();
               closeDialog();
             }
@@ -908,25 +943,38 @@ window.__ModuleLoader__.load({
         const fileCount =
           plan === null ? 0 : plan.groups.reduce((sum, group) => sum + group.files.length, 0);
 
+        const branch =
+          plan === null
+            ? ''
+            : plan.vcs === 'svn' && plan.revision !== undefined
+              ? `${plan.branch}@r${plan.revision}`
+              : plan.branch;
+
         const subtitle = (() => {
           if (phase === 'analyzing') return tr('dialog.analyzing');
           if (phase === 'naming' && plan !== null) {
             return tr('dialog.naming').replace('{model}', dialog.model ?? '');
           }
           if (plan === null) return dialog.error;
-          const branch =
-            plan.vcs === 'svn' && plan.revision !== undefined ? `${plan.branch}@r${plan.revision}` : plan.branch;
           return tr('dialog.summary')
             .replace('{groups}', String(plan.groups.length))
-            .replace('{files}', String(fileCount))
-            .replace('{branch}', branch ?? '')
-            .replace('{vcs}', String(plan.vcs).toUpperCase());
+            .replace('{files}', String(fileCount));
         })();
+
+        // Branch and VCS sit beside the summary as plain labels; no dot
+        // separators, and they stay out of the way while the model is planning.
+        const showMeta = plan !== null && phase !== 'analyzing' && phase !== 'naming' && phase !== 'error';
 
         const head = h('div', { key: 'head', className: 'dsh-sc-head' }, [
           h('div', { key: 'text', className: 'dsh-sc-head-text' }, [
             h('div', { key: 'title', className: 'dsh-sc-title' }, tr('dialog.title')),
-            h('div', { key: 'sub', className: 'dsh-sc-sub', title: subtitle }, subtitle),
+            h('div', { key: 'subrow', className: 'dsh-sc-subrow' }, [
+              h('div', { key: 'sub', className: 'dsh-sc-sub', title: subtitle }, subtitle),
+              showMeta && branch !== ''
+                ? h('span', { key: 'branch', className: 'dsh-sc-branch', title: branch }, branch)
+                : null,
+              showMeta ? h('span', { key: 'vcs', className: 'dsh-sc-vcs' }, String(plan.vcs).toUpperCase()) : null,
+            ]),
           ]),
           h(
             'button',
@@ -942,6 +990,112 @@ window.__ModuleLoader__.load({
             '\u00d7',
           ),
         ]);
+
+        const selectedCount = (dialog.selected ?? []).length;
+        const setMoveMenu = (open) => {
+          if (store.dialog === null) return;
+          store.dialog = { ...store.dialog, moveMenu: open };
+          emit();
+        };
+        const selectionTools =
+          phase === 'edit' && plan !== null && selectedCount > 0
+            ? h('div', { key: 'selection', className: 'dsh-sc-selbar' }, [
+                h(
+                  'span',
+                  { key: 'count', className: 'dsh-sc-selcount', role: 'status', 'aria-live': 'polite' },
+                  tr('dialog.selected').replace('{n}', String(selectedCount)),
+                ),
+                h('div', { key: 'dropdown', className: 'dsh-sc-dropdown' }, [
+                  h(
+                    'button',
+                    {
+                      key: 'moveto',
+                      type: 'button',
+                      className: 'dsh-sc-moveto',
+                      'aria-haspopup': 'menu',
+                      'aria-expanded': dialog.moveMenu === true ? 'true' : 'false',
+                      onClick: () => setMoveMenu(dialog.moveMenu !== true),
+                    },
+                    [
+                      h('span', { key: 'label' }, tr('dialog.moveTo')),
+                      h('span', { key: 'caret', className: 'dsh-sc-caret', 'aria-hidden': 'true' }),
+                    ],
+                  ),
+                  dialog.moveMenu === true
+                    ? h('div', {
+                        key: 'scrim',
+                        className: 'dsh-sc-scrim',
+                        onClick: () => setMoveMenu(false),
+                      })
+                    : null,
+                  dialog.moveMenu === true
+                    ? h(
+                        'div',
+                        {
+                          key: 'menu',
+                          className: 'dsh-sc-menu',
+                          role: 'menu',
+                          'aria-label': tr('dialog.moveTo'),
+                        },
+                        [
+                          ...plan.groups.map((group, index) =>
+                            h(
+                              'button',
+                              {
+                                key: group.id,
+                                type: 'button',
+                                role: 'menuitem',
+                                className: 'dsh-sc-menu-item',
+                                onClick: () => moveSelected(group.id),
+                              },
+                              [
+                                h(
+                                  'span',
+                                  { key: 'label' },
+                                  tr('dialog.groupN').replace('{n}', String(index + 1)),
+                                ),
+                                h(
+                                  'span',
+                                  { key: 'count', className: 'dsh-sc-menu-count' },
+                                  tr('dialog.files').replace('{n}', String(group.files.length)),
+                                ),
+                              ],
+                            ),
+                          ),
+                          h('div', { key: 'sep', className: 'dsh-sc-menu-sep', 'aria-hidden': 'true' }),
+                          h(
+                            'button',
+                            {
+                              key: 'new',
+                              type: 'button',
+                              role: 'menuitem',
+                              className: 'dsh-sc-menu-item',
+                              onClick: () => moveSelected('new'),
+                            },
+                            tr('dialog.newGroup'),
+                          ),
+                        ],
+                      )
+                    : null,
+                ]),
+                h(
+                  'button',
+                  {
+                    key: 'clear',
+                    type: 'button',
+                    className: 'dsh-sc-clear',
+                    title: tr('dialog.clearSelection'),
+                    'aria-label': tr('dialog.clearSelection'),
+                    onClick: () => {
+                      if (store.dialog === null) return;
+                      store.dialog = { ...store.dialog, selected: [], moveMenu: false };
+                      emit();
+                    },
+                  },
+                  '\u00d7',
+                ),
+              ])
+            : null;
 
         const footer = (() => {
           if (phase === 'committing') {
@@ -985,7 +1139,7 @@ window.__ModuleLoader__.load({
                   ? tr('dialog.needUnstage')
                   : tr('dialog.hint');
           return h('div', { key: 'foot', className: 'dsh-sc-foot' }, [
-            h('span', { key: 'hint', className: 'dsh-sc-foot-hint', title: hint }, hint),
+            selectionTools ?? h('span', { key: 'hint', className: 'dsh-sc-foot-hint', title: hint }, hint),
             h(
               'button',
               { key: 'cancel', type: 'button', className: 'dsh-sc-ghost', onClick: close },
@@ -1042,6 +1196,7 @@ window.__ModuleLoader__.load({
                 const failure = dialog.failures.find((item) => item.index === index);
                 const invalid = dialog.messageErrors.find((item) => item.index === index);
                 const open = expanded.has(group.id);
+                const allSelected = group.files.every((file) => selected.has(file));
                 const shown = open ? group.files : group.files.slice(0, CHIP_LIMIT);
                 const hidden = group.files.length - shown.length;
                 return h(
@@ -1140,7 +1295,11 @@ window.__ModuleLoader__.load({
                           )
                         : null,
                     ]),
-                    h('div', { key: 'chips', className: 'dsh-sc-chips' }, [
+                    h('div', {
+                      key: 'chips',
+                      className: 'dsh-sc-chips',
+                      'data-selecting': selected.size > 0 ? 'true' : undefined,
+                    }, [
                       ...shown.map((file) =>
                         h(
                           'button',
@@ -1198,79 +1357,24 @@ window.__ModuleLoader__.load({
                         {
                           key: 'select-group',
                           type: 'button',
-                          className: 'dsh-sc-chip dsh-sc-chip-more',
+                          className: 'dsh-sc-gsel',
+                          title: allSelected
+                            ? tr('dialog.clearGroup')
+                            : tr('dialog.selectGroup').replace('{n}', String(group.files.length)),
+                          'aria-label': allSelected
+                            ? tr('dialog.clearGroup')
+                            : tr('dialog.selectGroup').replace('{n}', String(group.files.length)),
+                          'aria-pressed': allSelected ? 'true' : 'false',
+                          'data-checked': allSelected ? 'true' : undefined,
                           disabled: !editable,
                           onClick: () => toggleSelectedInGroup(group),
                         },
-                        group.files.every((file) => selected.has(file))
-                          ? tr('dialog.clearGroup')
-                          : tr('dialog.selectGroup').replace('{n}', String(group.files.length)),
+                        allSelected ? '\u2713' : '',
                       ),
                     ]),
                   ],
                 );
               });
-
-        const moveTarget =
-          plan !== null && plan.groups.some((group) => group.id === dialog.moveTarget)
-            ? dialog.moveTarget
-            : 'new';
-        const selectionBar =
-          plan === null || !editable || selected.size === 0
-            ? null
-            : h('div', { key: 'selection', className: 'dsh-sc-selectbar' }, [
-                h(
-                  'span',
-                  { key: 'count', className: 'dsh-sc-selectbar-count', role: 'status', 'aria-live': 'polite' },
-                  tr('dialog.selected').replace('{n}', String(selected.size)),
-                ),
-                h(
-                  'select',
-                  {
-                    key: 'target',
-                    className: 'dsh-sc-select',
-                    value: moveTarget,
-                    'aria-label': tr('dialog.moveTo'),
-                    onChange: (event) => {
-                      store.dialog = { ...store.dialog, moveTarget: event.target.value };
-                      emit();
-                    },
-                  },
-                  [
-                    ...plan.groups.map((group, index) =>
-                      h(
-                        'option',
-                        { key: group.id, value: group.id },
-                        tr('dialog.groupN').replace('{n}', String(index + 1)),
-                      ),
-                    ),
-                    h('option', { key: 'new', value: 'new' }, tr('dialog.newGroup')),
-                  ],
-                ),
-                h(
-                  'button',
-                  {
-                    key: 'move',
-                    type: 'button',
-                    className: 'dsh-sc-primary dsh-sc-mini',
-                    onClick: () => moveSelected(moveTarget),
-                  },
-                  tr('dialog.move'),
-                ),
-                h(
-                  'button',
-                  {
-                    key: 'clear',
-                    type: 'button',
-                    className: 'dsh-sc-ghost dsh-sc-mini',
-                    onClick: () => {
-                      store.dialog = { ...store.dialog, selected: [] };
-                      emit();
-                    },
-                  },
-                  tr('dialog.clearSelection'),
-                ),
-              ]);
 
         let body;
         if (phase === 'analyzing') {
@@ -1302,7 +1406,6 @@ window.__ModuleLoader__.load({
             dialog.error !== ''
               ? h('div', { key: 'error', className: 'dsh-sc-warn', role: 'alert' }, dialog.error)
               : null,
-            selectionBar,
             phase === 'edit'
               ? h('div', { key: 'regroup-hint', className: 'dsh-sc-note' }, tr('dialog.regroupHint'))
               : null,
