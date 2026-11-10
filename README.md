@@ -33,8 +33,8 @@ The same flow works in a Git repository and in an SVN working copy; `vcs: auto` 
 
 - **Visible progress, in the dialog.** Clicking opens the dialog immediately: “Reading the working tree” plus a rule-based preview, then “Planning the groups with <model>”, then “Committing”. Closing the dialog aborts the model call.
 - **Git and SVN.** `auto` prefers Git when both exist (a git-svn checkout), otherwise the SVN working copy. Git commits stage explicit paths; SVN commits schedule new files with `svn add` and commit explicit paths, one revision per group.
-- **The model plans the groups, the host checks them.** The model receives a numbered list of every changed path (status, path, type hint, and the diff within budget) and decides the group count and membership, then names each group; `maxGroups` is only a ceiling. The host enforces coverage: files the model never claimed are grouped by the rules, repeated or out-of-range numbers are ignored, and no path is dropped. Docs, tests, CI, and build types are locked to what the path says; only source groups may pick `fix` / `refactor` / `perf`.
-- **Semantic messages, always.** Every group is named by the model, and count-only subjects ("modified 5 files", "update files") are rejected outright. Headers are normalized, then invalid ones get a targeted repair round; groups the model missed, split out, or merged are sent back to the model for naming. A group that still has no valid message stays blank and blocks the commit, while the rule fallback names concrete files or areas (never file counts) and the dialog flags the groups that still need a better name.
+- **The model plans the groups, the host checks them.** The model receives a numbered list of every changed path (status, path, type hint, and the diff within budget) and decides the group count and membership, then names each group; there is no group ceiling. The host enforces coverage: files the model never claimed are grouped by the rules, repeated or out-of-range numbers are ignored, and no path is dropped. Docs, tests, CI, and build types are locked to what the path says; only source groups may pick `fix` / `refactor` / `perf`.
+- **Semantic messages, always.** Every group is named by the model, and count-only subjects ("modified 5 files", "update files") are rejected outright. Headers are normalized, then invalid ones get a targeted repair round; groups the model missed or the host had to split out are sent back to the model for naming. A group that still has no valid message stays blank and blocks the commit, while the rule fallback names concrete files or areas (never file counts) and the dialog flags the groups that still need a better name.
 - **No agent turn and no command.** The button calls the plugin's own JSON channel on the host, so no `command/run` node is appended, no chat message is added, no tools run, and a model transport failure cannot leave a commit stuck in the conversation.
 - **The rules live in code.** `@commitlint/config-angular` is enforced by the host: one type per commit, header ≤ 72, subject ≤ 50, explicit paths, no `--amend` / `--force` / `--no-verify`.
 - **Editable grouping and messages.** Before anything is written you can rewrite every message and also rearrange the groups: select files and move them to another group or a new one, drag a file onto a target group, or use ↑ to merge a group into the one above; changed groups are tagged “Grouping changed”. Paths, file counts, skipped sensitive files, and model notes stay visible. Every message is validated before the first group commits, so a bad header in group 3 cannot leave groups 1–2 committed.
@@ -100,7 +100,6 @@ Override the inserted row in the profile's `cordis.patch.yml`:
     gitPath: ''
     svnPath: ''
     timeoutMs: 20000
-    maxGroups: 12
     useModel: true
     modelTimeoutMs: 60000
     maxInputChars: 32000
@@ -114,14 +113,13 @@ Override the inserted row in the profile's `cordis.patch.yml`:
 | `gitPath` | auto | Explicit git binary; empty probes `/usr/bin/git`, Homebrew, `/usr/local/bin/git` |
 | `svnPath` | auto | Explicit svn binary; empty probes `/usr/bin/svn`, Homebrew, `/usr/local/bin/svn` |
 | `timeoutMs` | `20000` | Deadline for each git / svn invocation |
-| `maxGroups` | `12` | Safety ceiling: the model may use at most this many groups; beyond it whole types are merged and no path is dropped |
 | `useModel` | `true` | `false` skips the model; every message must be written by hand |
 | `modelTimeoutMs` | `60000` | Deadline for one model planning call |
 | `maxInputChars` | `32000` | Character budget for one planning request: numbered list plus diff |
 | `maxTokens` | `2000` | Output cap for the summarization |
 | `repairRounds` | `1` | Targeted naming rounds for messages that failed validation or still hold a rule placeholder (0–3) |
 
-The model picks the group count; `maxGroups` is only the ceiling. Raise it (for example to `20`) for finer commits, lower it for coarser ones. Large change sets degrade in three steps: numbered paths → numbered rule units (type+scope buckets) when the paths do not fit → rule grouping only when even the units do not fit. The last two modes can still be adjusted in the dialog.
+The model alone picks the group count: there is no ceiling and no merging, so every group it names is kept as its own commit. Large change sets degrade in three steps: numbered paths → numbered rule units (type+scope buckets) when the paths do not fit → rule grouping only when even the units do not fit. The last two modes can still be adjusted in the dialog.
 
 ## How it works
 
@@ -147,7 +145,7 @@ The changed paths are numbered in a fixed order (with status code, a `docs`/`tes
 {"groups":[{"paths":[1,3],"type":"feat","scope":"auth","message":"feat(auth): add login endpoint"}]}
 ```
 
-The host does not take the model's word for the risky parts: every number must be used exactly once, out-of-range and repeated numbers are ignored, and files the model missed are grouped by the rules. Types decided by the path (docs / test / CI / build) are locked; only source groups may choose `fix` / `refactor` / `perf`. Messages are normalized and validated, then invalid ones get one targeted repair round with the failing groups, the exact error, and their diffs. Groups that the rules had to fill, split, or merge are sent back to the model with their paths and diffs so a count-style subject never becomes a commit message; if naming still fails, the group stays blank and the commit is blocked. Planning runs after the dialog is already on screen, and closing the dialog aborts the model stream through the request signal.
+The host does not take the model's word for the risky parts: every number must be used exactly once, out-of-range and repeated numbers are ignored, and files the model missed are grouped by the rules. Types decided by the path (docs / test / CI / build) are locked; only source groups may choose `fix` / `refactor` / `perf`. Messages are normalized and validated, then invalid ones get one targeted repair round with the failing groups, the exact error, and their diffs. Groups that the rules had to fill or split are sent back to the model with their paths and diffs so a count-style subject never becomes a commit message; if naming still fails, the group stays blank and the commit is blocked. Planning runs after the dialog is already on screen, and closing the dialog aborts the model stream through the request signal.
 
 ### 5. Commit
 
