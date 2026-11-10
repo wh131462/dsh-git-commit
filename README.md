@@ -125,7 +125,7 @@ The model alone picks the group count: there is no ceiling and no merging, so ev
 
 ### 1. Channel
 
-The button calls `POST /dsh-git-commit/<endpoint>` directly; requests and responses are JSON. The route is registered on the Harness `webServer` and reuses `connection.admit()`: same origin, Host/Origin fence, browser session credentials, owner Peer only. The host keeps no “pending plan”, so `analyze` / `name` / `commit` are stateless and there is no TTL to expire.
+The button calls `POST /dsh-git-commit/<endpoint>` directly; requests and responses are JSON. The route is registered on the Harness `webServer` and reuses `connection.admit()`: same origin, Host/Origin fence, browser session credentials, owner Peer only. The host keeps no “pending plan”, so `analyze` / `name` / `commit` are stateless and there is no TTL to expire. A clean tree is not an error: when there is nothing to commit, `analyze` / `name` answer `{api, empty: true, reason: "clean" | "sensitive", message}` with `ok: true`, and the Client just reports that message once and closes the dialog.
 
 ### 2. Probe
 

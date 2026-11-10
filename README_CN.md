@@ -125,7 +125,7 @@ plugin_manager install_bundle  target: "/absolute/path/eternalheart-dsh-git-comm
 
 ### 1. 通道
 
-按钮通过 `POST /dsh-git-commit/<endpoint>` 直接调用 Host，请求和响应都是 JSON。路由注册在 Harness 的 `webServer` 上，并复用 `connection.admit()`：同源、通过 Host/Origin 检查、携带浏览器会话凭据、只允许 owner Peer。Host 端不保存“待提交计划”，也没有 TTL；`analyze` / `name` / `commit` 都是无状态的。
+按钮通过 `POST /dsh-git-commit/<endpoint>` 直接调用 Host，请求和响应都是 JSON。路由注册在 Harness 的 `webServer` 上，并复用 `connection.admit()`：同源、通过 Host/Origin 检查、携带浏览器会话凭据、只允许 owner Peer。Host 端不保存“待提交计划”，也没有 TTL；`analyze` / `name` / `commit` 都是无状态的。没有可提交内容不是错误：工作区干净（或只剩敏感文件）时，`analyze` / `name` 返回 `ok: true` 的 `{api, empty: true, reason: "clean" | "sensitive", message}`，Client 只提示一次这句话并关掉弹窗。
 
 ### 2. 探测
 

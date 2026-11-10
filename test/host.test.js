@@ -588,14 +588,42 @@ test('api.analyze returns groups with empty messages and a model label', async (
   }
 });
 
-test('api.analyze reports a clean tree as an informational failure', async () => {
+test('api.analyze reports a clean tree as an empty result, not an error', async () => {
   const repo = await createRepo();
   try {
     const { api } = makeApi(repo.dir);
-    await assert.rejects(
-      api.analyze({ sessionId: SESSION }),
-      (error) => error.code === 'clean' && /工作区干净/.test(error.message),
-    );
+    const result = await api.analyze({ sessionId: SESSION });
+    assert.equal(result.empty, true);
+    assert.equal(result.reason, 'clean');
+    assert.match(result.message, /工作区干净/);
+    assert.equal('plan' in result, false);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('api.analyze separates a sensitive-only tree from a clean one', async () => {
+  const repo = await createRepo();
+  try {
+    await writeFile(join(repo.dir, '.env'), 'TOKEN=x\n', 'utf8');
+    const { api } = makeApi(repo.dir);
+    const result = await api.analyze({ sessionId: SESSION });
+    assert.equal(result.empty, true);
+    assert.equal(result.reason, 'sensitive');
+    assert.match(result.message, /敏感文件/);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('api.name reports an emptied tree as an empty result too', async () => {
+  const repo = await createRepo();
+  try {
+    const { api } = makeApi(repo.dir, { llm: fakeLlm('{"groups":[]}') });
+    const result = await api.name({ sessionId: SESSION });
+    assert.equal(result.empty, true);
+    assert.equal(result.reason, 'clean');
+    assert.equal('plan' in result, false);
   } finally {
     await repo.cleanup();
   }
@@ -1155,6 +1183,25 @@ test('name keeps more than a dozen model groups', async () => {
   }
 });
 
+test('commit reports an emptied tree as stale instead of clean', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    const { api } = makeApi(repo.dir, { llm: fakeLlm('{"groups":[]}') });
+    const analyzed = await api.analyze({ sessionId: SESSION });
+    // Commit the whole change set elsewhere, then confirm the stale plan.
+    await exec(GIT, ['add', '-A'], { cwd: repo.dir });
+    await exec(GIT, ['commit', '-q', '-m', 'feat: 别处提交'], { cwd: repo.dir });
+
+    await assert.rejects(
+      api.commit({ sessionId: SESSION, plan: analyzed.plan, messages: [], unstage: false }),
+      (error) => error.code === 'stale' && /已经没有可提交的改动/.test(error.message),
+    );
+  } finally {
+    await repo.cleanup();
+  }
+});
+
 test('planFromSubmitted rejects duplicates, missing paths, and empty groups', async () => {
   const repo = await createRepo();
   try {
@@ -1312,12 +1359,30 @@ test('http route serializes a business failure as a 200 error envelope', async (
     const api = createApi(ctx, resolveConfig({ gitPath: GIT }));
     const route = createRouteHandler(ctx, api);
     const res = fakeResponse();
-    await route(fakeRequest({ body: { sessionId: SESSION } }), res);
+    await route(fakeRequest({ body: { sessionId: 'missing' } }), res);
     assert.equal(res.status, 200);
     const body = JSON.parse(res.body);
     assert.equal(body.ok, false);
-    assert.equal(body.error.code, 'clean');
-    assert.match(body.error.message, /工作区干净/);
+    assert.equal(body.error.code, 'no-session');
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('http route reports nothing to commit as a successful empty envelope', async () => {
+  const repo = await createRepo();
+  try {
+    const ctx = makeCtx(repo.dir);
+    const api = createApi(ctx, resolveConfig({ gitPath: GIT }));
+    const route = createRouteHandler(ctx, api);
+    const res = fakeResponse();
+    await route(fakeRequest({ body: { sessionId: SESSION } }), res);
+    assert.equal(res.status, 200);
+    const body = JSON.parse(res.body);
+    assert.equal(body.ok, true);
+    assert.equal(body.value.empty, true);
+    assert.equal(body.value.reason, 'clean');
+    assert.match(body.value.message, /工作区干净/);
   } finally {
     await repo.cleanup();
   }

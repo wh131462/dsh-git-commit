@@ -461,6 +461,8 @@ window.__ModuleLoader__.load({
       }
       if (store.starting.has(sessionId)) return;
       if (store.dialog !== null) closeDialog();
+      // A new attempt owns the button again; drop the previous result note.
+      store.notices.delete(sessionId);
 
       store.starting.add(sessionId);
       const requestId = ++store.seq;
@@ -503,6 +505,11 @@ window.__ModuleLoader__.load({
           return;
         }
         if (!isCurrent(requestId)) return;
+        if (analyzed.empty === true) {
+          store.dialog = null;
+          setNotice(sessionId, 'ok', analyzed.message, 9000);
+          return;
+        }
 
         store.dialog = {
           ...store.dialog,
@@ -518,6 +525,11 @@ window.__ModuleLoader__.load({
         try {
           const named = await call('name', { sessionId }, { signal: controller.signal, timeoutMs: NAME_TIMEOUT_MS });
           if (!isCurrent(requestId)) return;
+          if (named.empty === true) {
+            store.dialog = null;
+            setNotice(sessionId, 'ok', named.message, 9000);
+            return;
+          }
           store.dialog = {
             ...store.dialog,
             phase: 'edit',
@@ -858,7 +870,8 @@ window.__ModuleLoader__.load({
               : done
                 ? tr('action.cleanShort')
                 : tr('action.label');
-        const title = failure && state.notice !== null ? state.notice.text : tr('action.title');
+        // Failures and empty results both explain themselves on hover.
+        const title = state.notice !== null ? state.notice.text : tr('action.title');
 
         const run = () => {
           if (noSession) return;

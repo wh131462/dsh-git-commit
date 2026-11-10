@@ -63,7 +63,7 @@ const EMPTY_SUBJECT_RE =
 /** The one HTTP prefix this plugin owns on the composition's web server. */
 export const API_PREFIX = '/dsh-git-commit';
 /** Inline API revision; the Client names it when it needs to explain a mismatch. */
-export const API_VERSION = 4;
+export const API_VERSION = 5;
 /** Requests carry at most a plan, its paths, and the edited messages. */
 const BODY_LIMIT = 2 * 1024 * 1024;
 
@@ -801,7 +801,12 @@ async function analyzeGitRepo({ gitBin, cwd, timeoutMs }) {
   }
   const { groups, skipped } = groupEntries(entries);
   if (groups.length === 0) {
-    return { ok: false, clean: true, text: '只剩敏感文件，已全部跳过，没有可提交的内容。' };
+    return {
+      ok: false,
+      clean: true,
+      sensitive: true,
+      text: '只剩敏感文件，已全部跳过，没有可提交的内容。',
+    };
   }
   // A non-empty index cannot be committed over without mixing in staged work;
   // the plan carries the exact paths so the dialog can offer to unstage them.
@@ -860,7 +865,12 @@ async function analyzeSvnRepo({ svnBin, cwd, timeoutMs }) {
   }
   const { groups, skipped } = groupEntries(status.entries);
   if (groups.length === 0) {
-    return { ok: false, clean: true, text: '只剩敏感文件，已全部跳过，没有可提交的内容。' };
+    return {
+      ok: false,
+      clean: true,
+      sensitive: true,
+      text: '只剩敏感文件，已全部跳过，没有可提交的内容。',
+    };
   }
   const warnings = [...status.warnings];
   if (status.missing.length > 0) {
@@ -2030,14 +2040,31 @@ export function createApi(ctx, config) {
     });
     if (!analysis.ok) {
       const code =
-        analysis.clean === true
-          ? 'clean'
-          : analysis.notRepo === true
-            ? 'not-a-repo'
-            : 'analyze-failed';
+        analysis.sensitive === true
+          ? 'sensitive'
+          : analysis.clean === true
+            ? 'clean'
+            : analysis.notRepo === true
+              ? 'not-a-repo'
+              : 'analyze-failed';
       throw new ApiError(code, analysis.text);
     }
     return analysis.plan;
+  }
+
+  /**
+   * Nothing to commit is a normal answer, not an error: hand the Client an
+   * empty result so it can close the dialog and say so once.
+   * @param error - the `clean` / `sensitive` business error.
+   * @returns the success payload for an empty working tree.
+   */
+  function emptyResult(error) {
+    return {
+      api: API_VERSION,
+      empty: true,
+      reason: error.code,
+      message: error.message,
+    };
   }
 
   /** The model route this Session uses, when naming is on. */
@@ -2051,7 +2078,15 @@ export function createApi(ctx, config) {
    */
   async function analyze(payload) {
     const target = resolveTarget(ctx, payload?.sessionId);
-    const plan = await analyzePlan(target);
+    let plan;
+    try {
+      plan = await analyzePlan(target);
+    } catch (error) {
+      if (error instanceof ApiError && (error.code === 'clean' || error.code === 'sensitive')) {
+        return emptyResult(error);
+      }
+      throw error;
+    }
     for (const group of plan.groups) {
       group.suggestion = group.message;
       group.message = '';
@@ -2071,7 +2106,15 @@ export function createApi(ctx, config) {
    */
   async function nameMessages(payload, { signal } = {}) {
     const target = resolveTarget(ctx, payload?.sessionId);
-    const plan = await analyzePlan(target);
+    let plan;
+    try {
+      plan = await analyzePlan(target);
+    } catch (error) {
+      if (error instanceof ApiError && (error.code === 'clean' || error.code === 'sensitive')) {
+        return emptyResult(error);
+      }
+      throw error;
+    }
     const route = routeFor(target);
     const named = await namePlan(ctx, config, plan, {
       signal,
@@ -2096,7 +2139,20 @@ export function createApi(ctx, config) {
    */
   async function commit(payload) {
     const target = resolveTarget(ctx, payload?.sessionId);
-    const fresh = await analyzePlan(target);
+    let fresh;
+    try {
+      fresh = await analyzePlan(target);
+    } catch (error) {
+      if (error instanceof ApiError && (error.code === 'clean' || error.code === 'sensitive')) {
+        throw new ApiError(
+          'stale',
+          error.code === 'sensitive'
+            ? error.message
+            : '工作区已经没有可提交的改动（可能已在别处提交），请重新分析。',
+        );
+      }
+      throw error;
+    }
     const groups = planFromSubmitted(payload?.plan, fresh);
 
     const messages = payload?.messages;
