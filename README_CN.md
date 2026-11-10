@@ -16,7 +16,7 @@ Git 仓库与 SVN 工作副本走同一套流程；`vcs: auto` 自动选择，`v
 
 ```text
 ┌ 确认提交 ───────────────────────────────────────────────── × ┐
-│ 5 组 / 79 个文件 · main · GIT                                 │
+│ 5 组，79 个文件   main   GIT                                  │
 │ ⟳ 正在用 deepseek-official/deepseek-flash 规划分组…           │
 │ 1  build(backend-coal-mind-agent): 更新镜像权限               │
 │    backend/coal-mind-agent/Dockerfile            1 个文件     │
@@ -172,6 +172,7 @@ Host 不接受模型说了算的部分：每个编号必须恰好被用到一次
 - **一个文件只属于一组**：无法把同一文件拆到多个组，这与插件在 Git 下不做 hunk 级暂存的行为一致。
 - **新目录**会展开为具体文件（上限 2000 个）；超出的目录会跳过并提示，而不是整个加入。新增父目录用 `--depth empty` 调度，同级的 `.env` 之类不会被顺带加入。
 - **过期提交**会被服务端拒绝并如实报告；需要合并时请自行执行 `svn update`。
+- **非 ASCII 路径与日志**：所有 svn 命令都在 UTF-8 locale 下运行（优先 `C.UTF-8`，其次 `en_US.UTF-8`），中文或带重音符号的路径可以正常 add、提交，读回的日志也不会变成 `{U+...}` 转义；svn 自身的消息仍是英文，解析不受影响。
 - **凭据**完全不碰：所有命令都带 `--non-interactive`，需要认证时请先运行 `svn auth`。
 
 ## 开发
@@ -191,11 +192,11 @@ locale/           插件元数据（en、zh）
 test/             使用真实临时 git / svn 仓库的 Host 与路由测试
 ```
 
-插件没有运行时依赖：Host 只用 Node 内置模块，Client 的 React 来自 Harness 的模块表。测试会创建真实临时仓库并驱动一个 stub LLM，覆盖分组、无丢路径的合并、校验、修复轮、留空阻断、暂存释放、失败回滚、工作区变化拦截，以及通道的鉴权、方法和 JSON 校验；安装 `svn`/`svnadmin` 时还会跑真实工作副本、revision、敏感文件跳过与 add 回滚。
+插件没有运行时依赖：Host 只用 Node 内置模块，Client 的 React 来自 Harness 的模块表。测试会创建真实临时仓库并驱动一个 stub LLM，覆盖分组、无丢路径的合并、校验、修复轮、留空阻断、暂存释放、失败回滚、工作区变化拦截，以及通道的鉴权、方法和 JSON 校验；安装 `svn`/`svnadmin` 时还会跑真实工作副本、revision、敏感文件跳过、add 回滚，以及在插件 UTF-8 locale 下的非 ASCII 路径提交。
 
-## 从 2.x 升级
+## 从 2.0.1 升级
 
-3.0 移除了 `/smart-commit` 命令和 `<base64>` 参数：按钮不再经过命令管道，因此对话里不再出现 `smart-commit` 命令节点。配置项保持不变；升级后需要重启 DSH，让 Host 端注册新的 HTTP 通道。
+2.0.2 把分组交给当前会话的模型：由它决定这次改动分几组（不超过 `maxGroups`）、哪些文件归为一组，弹窗里还可以事后调整分组。只报数量的 subject 会被拒绝，默认分组预算更大（`maxGroups` 12、`maxInputChars` 32000），svn 改用 UTF-8 locale，非 ASCII 路径也能正常提交。配置项保持不变；升级后重启 DSH 即可。
 
 ## 参与贡献
 

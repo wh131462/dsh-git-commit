@@ -16,7 +16,7 @@ The same flow works in a Git repository and in an SVN working copy; `vcs: auto` 
 
 ```text
 ┌ Confirm commit ─────────────────────────────────────────── × ┐
-│ 5 groups / 79 files · main · GIT                              │
+│ 5 groups, 79 files   main   GIT                               │
 │ ⟳ Planning the groups with deepseek-official/deepseek-flash…  │
 │ 1  build(backend-coal-mind-agent): 更新镜像权限               │
 │    backend/coal-mind-agent/Dockerfile            1 file       │
@@ -172,11 +172,12 @@ The host does not take the model's word for the risky parts: every number must b
 - **One file, one group.** A file cannot be split across groups — the same limitation as the plugin's Git path, which never stages hunks.
 - **New directories** are expanded into their files (bounded at 2000); a larger directory is skipped with a warning instead of being swept in. New parent directories are scheduled with `--depth empty`, so a sibling like `.env` never rides along.
 - **Out-of-date commits** are rejected by the server and reported; run `svn update` yourself when you are ready to merge.
+- **Non-ASCII paths and messages.** Every svn command runs under a UTF-8 locale (`C.UTF-8`, falling back to `en_US.UTF-8`), so Chinese or accented paths can be added and committed, and log text reads back as UTF-8 instead of `{U+...}` escapes; svn's own messages stay in English, so parsing is unaffected.
 - **Credentials** are never touched: every command runs `--non-interactive`, so run `svn auth` beforehand if the server prompts.
 
-## Upgrading from 2.x
+## Upgrading from 2.0.1
 
-3.0 removes the `/smart-commit` command and its `<base64>` argument: the button no longer goes through the command pipeline, so no `smart-commit` node appears in the conversation. Configuration is unchanged; restart DSH after upgrading so the host registers the new HTTP channel.
+2.0.2 hands grouping to the session's model: it decides how many commits the change set becomes (up to `maxGroups`) and which files belong together, and the dialog lets you rearrange groups afterwards. Count-only subjects are rejected, the default grouping budget is larger (`maxGroups` 12, `maxInputChars` 32000), and svn runs under a UTF-8 locale so non-ASCII paths work. Configuration keys are unchanged; restart DSH after upgrading.
 
 ## Development guide
 
@@ -195,7 +196,7 @@ locale/           plugin metadata (en, zh)
 test/             host and route tests with real temporary git / svn repositories
 ```
 
-The bundle has no runtime dependencies: the host half uses Node built-ins, and the client half gets React from the Harness module table. The tests create real temporary repositories and drive a stub LLM, covering grouping, consolidation without path loss, validation, repair rounds, blocked groups, index release, failed-commit rollback, stale-plan refusal, and the channel's auth, method, and JSON checks; with `svn`/`svnadmin` installed they also run real SVN checkouts, revisions, sensitive-file skipping, and add rollback.
+The bundle has no runtime dependencies: the host half uses Node built-ins, and the client half gets React from the Harness module table. The tests create real temporary repositories and drive a stub LLM, covering grouping, consolidation without path loss, validation, repair rounds, blocked groups, index release, failed-commit rollback, stale-plan refusal, and the channel's auth, method, and JSON checks; with `svn`/`svnadmin` installed they also run real SVN checkouts, revisions, sensitive-file skipping, add rollback, and non-ASCII paths under the plugin's UTF-8 locale.
 
 ## Contributing
 
