@@ -175,9 +175,9 @@ The host does not take the model's word for the risky parts: every number must b
 - **Non-ASCII paths and messages.** Every svn command runs under a UTF-8 locale (`C.UTF-8`, falling back to `en_US.UTF-8`), so Chinese or accented paths can be added and committed, and log text reads back as UTF-8 instead of `{U+...}` escapes; svn's own messages stay in English, so parsing is unaffected.
 - **Credentials** are never touched: every command runs `--non-interactive`, so run `svn auth` beforehand if the server prompts.
 
-## Upgrading from 2.0.1
+## Upgrading from 2.0.2
 
-2.0.2 hands grouping to the session's model: it decides how many commits the change set becomes (up to `maxGroups`) and which files belong together, and the dialog lets you rearrange groups afterwards. Count-only subjects are rejected, the default grouping budget is larger (`maxGroups` 12, `maxInputChars` 32000), and svn runs under a UTF-8 locale so non-ASCII paths work. Configuration keys are unchanged; restart DSH after upgrading.
+2.0.3 refines the confirmation dialog: selected-file actions now sit in the footer behind a themed "Move to" menu instead of a native select, selected chips are highlighted without moving the layout, and group selection uses a fixed-size checkbox. Configuration keys are unchanged; restart DSH after upgrading.
 
 ## Development guide
 
