@@ -12,8 +12,6 @@
         svnPath: ''
         # Per-invocation git/svn deadline.
         timeoutMs: 20000
-        # Ceiling for the model's own grouping; past it, whole types merge.
-        maxGroups: 12
         # One model call decides the groups and names them, on this Session's route.
         useModel: true
         modelTimeoutMs: 60000
