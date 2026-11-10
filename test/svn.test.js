@@ -202,7 +202,6 @@ test('analyzes and commits a real SVN working copy', { skip: !HAS_SVN }, async (
       gitBin: GIT,
       svnBin: SVN,
       cwd: repo.wc,
-      maxGroups: 6,
       timeoutMs: 20000,
     });
     assert.equal(analysis.ok, true, analysis.text);
@@ -293,7 +292,6 @@ test('refuses to analyze a conflicted working copy', { skip: !HAS_SVN }, async (
       vcs: 'svn',
       svnBin: SVN,
       cwd: repo.wc,
-      maxGroups: 6,
       timeoutMs: 20000,
     });
     assert.equal(analysis.ok, false);
@@ -373,7 +371,6 @@ test('reports a directory that is neither Git nor SVN', async () => {
       gitBin: GIT,
       svnBin: SVN,
       cwd: dir,
-      maxGroups: 6,
       timeoutMs: 10000,
     });
     assert.equal(analysis.ok, false);

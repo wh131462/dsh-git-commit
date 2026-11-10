@@ -291,7 +291,7 @@ test('groups by type and scope and keeps messages valid', () => {
   assert.deepEqual(feats[0].files, ['src/app.js', 'src/util.js']);
 });
 
-test('consolidates whole types past maxGroups without mixing or losing files', () => {
+test('keeps every type+scope unit as its own group, with no ceiling', () => {
   const entries = [
     { code: '??', path: 'a/one.ts' },
     { code: ' M', path: 'a/one.spec.ts' },
@@ -299,9 +299,10 @@ test('consolidates whole types past maxGroups without mixing or losing files', (
     { code: '??', path: 'b/three.ts' },
     { code: ' M', path: 'b/four.ts' },
   ];
-  const { groups } = groupEntries(entries, 3);
-  assert.equal(groups.length, 4);
-  assert.equal(new Set(groups.map((group) => group.type)).size, groups.length);
+  const { groups } = groupEntries(entries);
+  assert.equal(groups.length, 5);
+  const keys = groups.map((group) => `${group.type}/${group.scope}`);
+  assert.equal(new Set(keys).size, groups.length);
   const covered = groups.flatMap((group) => group.files).sort();
   assert.deepEqual(covered, entries.map((entry) => entry.path).sort());
   for (const group of groups) assert.equal(validateMessage(group.message), null);
@@ -338,24 +339,21 @@ test('rejects subjects that only report a count or a bare scope', () => {
   assert.equal(validateMessage('feat: add 2 login endpoints'), null);
 });
 
-test('rule messages name paths instead of counting files', () => {
-  const { groups } = groupEntries(
-    [
-      { code: '??', path: 'src/alpha/app.js' },
-      { code: '??', path: 'src/beta/app.js' },
-      { code: ' M', path: 'docs/guide/intro.md' },
-      { code: ' M', path: 'docs/guide/install.md' },
-    ],
-    1,
-  );
-  assert.equal(groups.length, 2);
+test('rule messages carry a scope or concrete file names, never a count', () => {
+  const { groups } = groupEntries([
+    { code: '??', path: 'src/alpha/app.js' },
+    { code: '??', path: 'src/beta/app.js' },
+    { code: ' M', path: 'docs/guide/intro.md' },
+    { code: ' M', path: 'docs/guide/install.md' },
+  ]);
+  assert.equal(groups.length, 3);
   for (const group of groups) {
     assert.equal(validateMessage(group.message), null, group.message);
     assert.doesNotMatch(group.message, /\d+\s*个(文件|文档|测试|配置)/, group.message);
   }
-  const feats = groups.find((group) => group.type === 'feat');
-  assert.match(feats.message, /alpha\/app\.js/);
-  assert.match(feats.message, /beta\/app\.js/);
+  const feats = groups.filter((group) => group.type === 'feat');
+  assert.equal(feats.length, 2);
+  for (const group of feats) assert.match(group.message, /src-(alpha|beta)/);
   const docs = groups.find((group) => group.type === 'docs');
   assert.match(docs.message, /intro\.md/);
   assert.match(docs.message, /install\.md/);
@@ -368,7 +366,6 @@ test('analyzes a real working tree into a wire plan', async () => {
     const analysis = await analyzeRepo({
       gitBin: GIT,
       cwd: repo.dir,
-      maxGroups: 6,
       timeoutMs: 20000,
     });
     assert.equal(analysis.ok, true);
@@ -398,7 +395,6 @@ test('commits every group without touching staged content or secrets', async () 
     const analysis = await analyzeRepo({
       gitBin: GIT,
       cwd: repo.dir,
-      maxGroups: 6,
       timeoutMs: 20000,
     });
     assert.equal(analysis.ok, true);
@@ -442,7 +438,6 @@ test('clears an orphaned index.lock and commits the tree', async () => {
     const analysis = await analyzeRepo({
       gitBin: GIT,
       cwd: repo.dir,
-      maxGroups: 6,
       timeoutMs: 20000,
     });
     assert.equal(analysis.ok, true, analysis.text);
@@ -502,7 +497,6 @@ test(
       const analysis = await analyzeRepo({
         gitBin: GIT,
         cwd: repo.dir,
-        maxGroups: 6,
         timeoutMs: 20000,
       });
       const pid = `PID ${holder.pid}`;
@@ -531,7 +525,6 @@ test('refuses to commit when the index already holds content', async () => {
     const analysis = await analyzeRepo({
       gitBin: GIT,
       cwd: repo.dir,
-      maxGroups: 6,
       timeoutMs: 20000,
     });
     assert.equal(analysis.ok, true);
@@ -551,7 +544,6 @@ test('rejects an invalid edited message before committing anything', async () =>
     const analysis = await analyzeRepo({
       gitBin: GIT,
       cwd: repo.dir,
-      maxGroups: 6,
       timeoutMs: 20000,
     });
     const messages = analysis.plan.groups.map((group) => group.message);
@@ -569,7 +561,7 @@ test('rejects an invalid edited message before committing anything', async () =>
 test('reports a directory that is not a repository', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-sc-nogit-'));
   try {
-    const analysis = await analyzeRepo({ gitBin: GIT, cwd: dir, maxGroups: 6, timeoutMs: 20000 });
+    const analysis = await analyzeRepo({ gitBin: GIT, cwd: dir, timeoutMs: 20000 });
     assert.equal(analysis.ok, false);
     assert.match(analysis.text, /不是 Git 仓库/);
   } finally {
@@ -990,11 +982,10 @@ test('unit input numbers rule buckets and expands back to files', async () => {
   const repo = await createRepo();
   try {
     await populate(repo.dir);
-    const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, maxGroups: 12, timeoutMs: 20000 });
+    const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, timeoutMs: 20000 });
     const built = await buildUnitGroupingInput(GIT, analysis.plan, {
       budget: 20000,
       timeoutMs: 20000,
-      maxGroups: 12,
     });
     assert.ok(built !== null);
     assert.match(built.text, /规则单元/);
@@ -1109,14 +1100,11 @@ test('ignores repeated and out-of-range indices without losing files', async () 
   }
 });
 
-test('merges whole types when the model exceeds maxGroups', () => {
-  const entries = [
-    { code: ' M', path: 'a/one.js' },
-    { code: ' M', path: 'b/two.js' },
-    { code: ' M', path: 'c/three.js' },
-    { code: ' M', path: 'docs/x.md' },
-    { code: ' M', path: 'docs/y.md' },
-  ];
+test('keeps every model group, no matter how many', () => {
+  const entries = Array.from({ length: 20 }, (_value, index) => ({
+    code: ' M',
+    path: `mod${index}/file${index}.js`,
+  }));
   const plan = {
     vcs: 'git',
     cwd: '/tmp',
@@ -1125,17 +1113,17 @@ test('merges whole types when the model exceeds maxGroups', () => {
     staged: [],
     skipped: [],
     entries,
-    groups: groupEntries(entries, 99).groups,
+    groups: groupEntries(entries).groups,
   };
-  const candidates = plan.groups.map((group) => ({
+  const candidates = plan.groups.map((group, index) => ({
     paths: group.files,
-    type: group.type,
-    scope: group.scope,
-    message: group.message,
+    type: 'fix',
+    scope: `mod${index}`,
+    message: `fix(mod${index}): 修正模块 ${index} 的行为`,
   }));
-  const applied = applyModelGroups(plan, candidates, { maxGroups: 2 });
-  assert.equal(applied.groups.length, 2);
-  assert.ok(applied.merged > 0);
+  const applied = applyModelGroups(plan, candidates);
+  assert.equal(applied.groups.length, 20);
+  assert.equal('merged' in applied, false);
   assert.deepEqual(
     applied.groups.flatMap((group) => group.files).sort(),
     entries.map((entry) => entry.path).sort(),
@@ -1143,11 +1131,35 @@ test('merges whole types when the model exceeds maxGroups', () => {
   for (const group of applied.groups) assert.equal(validateMessage(group.message), null, group.message);
 });
 
+test('name keeps more than a dozen model groups', async () => {
+  const repo = await createRepo();
+  try {
+    const groups = [];
+    for (let index = 0; index < 15; index += 1) {
+      await mkdir(join(repo.dir, `pkg${index}`), { recursive: true });
+      await writeFile(join(repo.dir, `pkg${index}`, 'index.js'), `export const n = ${index};\n`, 'utf8');
+      groups.push({
+        paths: [`pkg${index}/index.js`],
+        type: 'feat',
+        scope: `pkg${index}`,
+        message: `feat(pkg${index}): 新增模块 ${index}`,
+      });
+    }
+    const { api } = makeApi(repo.dir, { llm: fakeLlm(JSON.stringify({ groups })) });
+    const named = await api.name({ sessionId: SESSION });
+    assert.equal(named.plan.groups.length, 15);
+    assert.equal(named.messages.length, 15);
+    assert.doesNotMatch(named.note, /上限|合并/);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
 test('planFromSubmitted rejects duplicates, missing paths, and empty groups', async () => {
   const repo = await createRepo();
   try {
     await populate(repo.dir);
-    const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, maxGroups: 12, timeoutMs: 20000 });
+    const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, timeoutMs: 20000 });
     const plan = publicPlan(analysis.plan);
 
     const duplicated = { ...plan, groups: [...plan.groups, { ...plan.groups[0] }] };
@@ -1190,7 +1202,7 @@ test('assertPlanMatches accepts edited messages and rejects a changed grouping',
   const repo = await createRepo();
   try {
     await populate(repo.dir);
-    const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, maxGroups: 6, timeoutMs: 20000 });
+    const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, timeoutMs: 20000 });
     const plan = publicPlan(analysis.plan);
     const edited = { ...plan, groups: plan.groups.map((group) => ({ ...group, message: 'docs: 改过' })) };
     assert.doesNotThrow(() => assertPlanMatches(edited, analysis.plan));
@@ -1323,11 +1335,10 @@ test('grouping input numbers every path, carries diff text, and honors the budge
   const repo = await createRepo();
   try {
     await populate(repo.dir);
-    const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, maxGroups: 12, timeoutMs: 20000 });
+    const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, timeoutMs: 20000 });
     const input = await buildGroupingInput(GIT, analysis.plan, {
       budget: 100000,
       timeoutMs: 20000,
-      maxGroups: 12,
     });
     assert.match(input, /待提交文件：6 个/);
     assert.match(input, /^1\. /m);
@@ -1341,7 +1352,6 @@ test('grouping input numbers every path, carries diff text, and honors the budge
     const bounded = await buildGroupingInput(GIT, analysis.plan, {
       budget: 1500,
       timeoutMs: 20000,
-      maxGroups: 12,
     });
     assert.ok(bounded.length < 1800, `bounded input was ${bounded.length} chars`);
 
@@ -1368,7 +1378,7 @@ test('a failing commit puts this run staging back and keeps the work', async () 
     await writeFile(hook, '#!/bin/sh\nexit 1\n', 'utf8');
     await chmod(hook, 0o755);
 
-    const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, maxGroups: 6, timeoutMs: 20000 });
+    const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, timeoutMs: 20000 });
     const messages = analysis.plan.groups.map((group) => group.message);
     const outcome = await commitPlan(analysis.plan, messages, { gitBin: GIT, timeoutMs: 20000 });
     assert.equal(outcome.ok, false);
@@ -1390,10 +1400,10 @@ test('config defaults clamp bad values', () => {
   const defaults = resolveConfig(undefined);
   assert.equal(defaults.gitPath, '');
   assert.equal(defaults.timeoutMs, 20000);
-  assert.equal(defaults.maxGroups, 12);
+  assert.equal('maxGroups' in defaults, false);
 
   const custom = resolveConfig({ gitPath: ' /usr/bin/git ', timeoutMs: -1, maxGroups: 0 });
   assert.equal(custom.gitPath, '/usr/bin/git');
   assert.equal(custom.timeoutMs, 20000);
-  assert.equal(custom.maxGroups, 12);
+  assert.equal('maxGroups' in custom, false);
 });
