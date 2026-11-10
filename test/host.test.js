@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { spawn, execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { chmod, mkdir, mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -29,6 +30,7 @@ import {
   parseStatus,
   planFromSubmitted,
   publicPlan,
+  recoverGitLock,
   resolveConfig,
   scopeOf,
   validateMessage,
@@ -421,6 +423,105 @@ test('commits every group without touching staged content or secrets', async () 
     await repo.cleanup();
   }
 });
+
+test('clears an orphaned index.lock and commits the tree', async () => {
+  const repo = await createRepo();
+  try {
+    await populate(repo.dir);
+    const lock = join(repo.dir, '.git', 'index.lock');
+    await writeFile(lock, '', 'utf8');
+
+    const probe = await recoverGitLock(GIT, repo.dir, { timeoutMs: 20000 });
+    assert.equal(probe.status, 'removed', JSON.stringify(probe));
+    assert.equal(probe.path, lock);
+    await assert.rejects(stat(lock), /ENOENT/);
+
+    // The same recovery has to work from inside a commit: a lock that appears
+    // after analysis must not abort the run.
+    await writeFile(lock, '', 'utf8');
+    const analysis = await analyzeRepo({
+      gitBin: GIT,
+      cwd: repo.dir,
+      maxGroups: 6,
+      timeoutMs: 20000,
+    });
+    assert.equal(analysis.ok, true, analysis.text);
+    const messages = analysis.plan.groups.map((group) => group.message);
+    const outcome = await commitPlan(analysis.plan, messages, { gitBin: GIT, timeoutMs: 20000 });
+    assert.equal(outcome.ok, true, outcome.text);
+    assert.equal(existsSync(lock), false);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test('clears the exact lock path git reported, not just the index', async () => {
+  const repo = await createRepo();
+  try {
+    const lock = join(repo.dir, '.git', 'refs', 'heads', 'main.lock');
+    await writeFile(lock, '', 'utf8');
+    const probe = await recoverGitLock(GIT, repo.dir, {
+      timeoutMs: 20000,
+      stderr: `fatal: Unable to create '${lock}': File exists.`,
+    });
+    assert.equal(probe.status, 'removed');
+    assert.equal(probe.path, lock);
+    await assert.rejects(stat(lock), /ENOENT/);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test(
+  'keeps a lock that a live process holds and names the holder',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const repo = await createRepo();
+    const lock = join(repo.dir, '.git', 'index.lock');
+    let holder;
+    try {
+      await populate(repo.dir);
+      await writeFile(lock, '', 'utf8');
+      holder = spawn(
+        process.execPath,
+        ['-e', "require('node:fs').openSync(process.argv[1], 'r'); setInterval(() => {}, 1000);", lock],
+        { stdio: 'ignore' },
+      );
+
+      // Wait for the descriptor to be observable: lsof on macOS, /proc on Linux.
+      let probe = { status: 'none', pids: [] };
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        probe = await recoverGitLock(GIT, repo.dir, { timeoutMs: 20000 });
+        if (probe.status === 'held') break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.equal(probe.status, 'held', JSON.stringify(probe));
+      assert.deepEqual(probe.pids, [holder.pid]);
+      assert.equal(existsSync(lock), true, 'a live lock must never be deleted');
+
+      const analysis = await analyzeRepo({
+        gitBin: GIT,
+        cwd: repo.dir,
+        maxGroups: 6,
+        timeoutMs: 20000,
+      });
+      const pid = `PID ${holder.pid}`;
+      if (analysis.ok) {
+        const messages = analysis.plan.groups.map((group) => group.message);
+        const outcome = await commitPlan(analysis.plan, messages, { gitBin: GIT, timeoutMs: 20000 });
+        assert.equal(outcome.ok, false);
+        assert.match(outcome.text, new RegExp(pid));
+      } else {
+        // `git status` may already need the index; its message must name the holder too.
+        assert.match(analysis.text, new RegExp(pid));
+      }
+      assert.equal(existsSync(lock), true, 'the commit must leave the live lock alone');
+    } finally {
+      holder?.kill('SIGKILL');
+      await repo.cleanup();
+    }
+  },
+);
 
 test('refuses to commit when the index already holds content', async () => {
   const repo = await createRepo();
