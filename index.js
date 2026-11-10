@@ -20,9 +20,18 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import {
+  mkdtemp,
+  readFile,
+  readdir,
+  readlink,
+  rm,
+  stat,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 
 import {
   resolveSvn,
@@ -199,14 +208,13 @@ function resolveGit(configured) {
 }
 
 /**
- * Run one git command without a shell.
- * @param bin - git executable.
- * @param cwd - directory that anchors `-C`.
- * @param args - arguments after `-C <cwd>`.
+ * Run one command without a shell.
+ * @param bin - executable.
+ * @param args - full argument list.
  * @param options - optional stdin, timeout, and environment additions.
  * @returns `{ code, stdout, stderr }`; `code` is `-1` when spawn itself failed.
  */
-function runGit(bin, cwd, args, options = {}) {
+function runProcess(bin, args, options = {}) {
   const { input, timeoutMs = DEFAULTS.timeoutMs, env } = options;
   return new Promise((resolve) => {
     let stdout = '';
@@ -221,7 +229,7 @@ function runGit(bin, cwd, args, options = {}) {
     };
     let child;
     try {
-      child = spawn(bin, ['-C', cwd, ...args], {
+      child = spawn(bin, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: {
           ...process.env,
@@ -254,6 +262,194 @@ function runGit(bin, cwd, args, options = {}) {
     child.stdin.on('error', () => {});
     child.stdin.end(input ?? '');
   });
+}
+
+/**
+ * Run one git command without a shell and without lock recovery.
+ * @param bin - git executable.
+ * @param cwd - directory that anchors `-C`.
+ * @param args - arguments after `-C <cwd>`.
+ * @param options - optional stdin, timeout, and environment additions.
+ * @returns `{ code, stdout, stderr }`; `code` is `-1` when spawn itself failed.
+ */
+function runGitRaw(bin, cwd, args, options = {}) {
+  return runProcess(bin, ['-C', cwd, ...args], options);
+}
+
+/** Every message git prints when a repository lock is already taken or held. */
+const LOCK_ERROR_RE = /(?:Unable to create '.*\.lock'|index\.lock|Another git process seems to be running)/i;
+/** The path git itself names as the lock it could not create. */
+const LOCK_PATH_RE = /Unable to create '([^']+)'/;
+/** On platforms where no lock holder can be observed, age is the fallback. */
+const LOCK_STALE_FALLBACK_MS = 10 * 60_000;
+
+/**
+ * Resolve the index lock path for a working tree.
+ *
+ * `--git-path` answers for the worktree the command runs in, so a linked
+ * worktree gets its own lock rather than the common directory's.
+ *
+ * @param bin - git executable.
+ * @param cwd - repository directory.
+ * @param timeoutMs - command timeout.
+ * @returns an absolute path, or `null` when git cannot answer.
+ */
+async function indexLockPath(bin, cwd, timeoutMs) {
+  const run = await runGitRaw(
+    bin,
+    cwd,
+    ['-c', 'core.quotepath=false', 'rev-parse', '--git-path', 'index.lock'],
+    { timeoutMs },
+  );
+  if (run.code !== 0) return null;
+  const value = run.stdout.trim();
+  if (value === '') return null;
+  return isAbsolute(value) ? value : join(cwd, value);
+}
+
+/**
+ * Probe whether an open descriptor still references the lock file.
+ *
+ * A git process keeps the lock's descriptor open for the whole write, so a
+ * live holder is visible. `lsof` covers macOS and the BSDs, `/proc` covers
+ * Linux; anywhere else the answer is `known: false` and age decides.
+ *
+ * @param lockPath - absolute lock path.
+ * @returns `{ known, pids }` with numeric process ids.
+ */
+async function lockHolderPids(lockPath) {
+  if (process.platform === 'darwin' || process.platform === 'freebsd') {
+    const lsof = await runProcess('lsof', ['-t', lockPath], { timeoutMs: 3000 });
+    if (lsof.code === 0) {
+      const pids = lsof.stdout
+        .split('\n')
+        .map((line) => Number(line.trim()))
+        .filter((pid) => Number.isInteger(pid) && pid > 0);
+      return { known: true, pids: [...new Set(pids)].sort((a, b) => a - b) };
+    }
+    // 1 is lsof's "nothing matched"; an error on stderr means it could not see
+    // every process, so the lock must not be treated as orphaned.
+    const partial = lsof.code !== 1 || /permission denied/i.test(lsof.stderr);
+    return partial ? { known: false, pids: [] } : { known: true, pids: [] };
+  }
+  if (process.platform === 'linux') {
+    let entries;
+    try {
+      entries = await readdir('/proc');
+    } catch {
+      return { known: false, pids: [] };
+    }
+    const pids = new Set();
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      let fds;
+      try {
+        fds = await readdir(`/proc/${entry}/fd`);
+      } catch {
+        continue; // another user's process, or it exited mid-scan
+      }
+      for (const fd of fds) {
+        try {
+          if ((await readlink(`/proc/${entry}/fd/${fd}`)) === lockPath) {
+            pids.add(Number(entry));
+            break;
+          }
+        } catch {
+          /* the descriptor closed between readdir and readlink */
+        }
+      }
+    }
+    return { known: true, pids: [...pids].sort((a, b) => a - b) };
+  }
+  return { known: false, pids: [] };
+}
+
+/**
+ * Clear the lock a crashed or killed git left behind, and only that one.
+ *
+ * A lock is removed only when no live process holds it open. When a holder is
+ * found, or when the platform cannot prove the lock is orphaned and the file
+ * is young, the lock is left in place and reported instead: deleting it then
+ * would corrupt an index another git is writing.
+ *
+ * @param bin - git executable.
+ * @param cwd - repository directory.
+ * @param options - timeout, and the failing command's stderr to name the lock.
+ * @returns `{ status: 'none' | 'removed' | 'held' | 'unknown', path?, pids?, ageMs?, error? }`.
+ */
+export async function recoverGitLock(bin, cwd, { timeoutMs = DEFAULTS.timeoutMs, stderr = '' } = {}) {
+  const named = LOCK_PATH_RE.exec(stderr);
+  let path = named === null ? null : named[1];
+  if (path !== null && !isAbsolute(path)) path = join(cwd, path);
+  if (path === null) path = await indexLockPath(bin, cwd, timeoutMs);
+  if (path === null) return { status: 'none' };
+
+  let info;
+  try {
+    info = await stat(path);
+  } catch {
+    return { status: 'none', path };
+  }
+  const ageMs = Date.now() - info.mtimeMs;
+  const holders = await lockHolderPids(path);
+  if (holders.known && holders.pids.length > 0) {
+    return { status: 'held', path, pids: holders.pids, ageMs };
+  }
+  if (!holders.known && ageMs < LOCK_STALE_FALLBACK_MS) {
+    return { status: 'unknown', path, ageMs };
+  }
+  try {
+    await unlink(path);
+  } catch (error) {
+    // Lost the race with the process that removed it: nothing left to recover.
+    if (error instanceof Error && error.code === 'ENOENT') return { status: 'none', path };
+    return {
+      status: 'unknown',
+      path,
+      ageMs,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+  return { status: 'removed', path, ageMs };
+}
+
+/**
+ * Run one git command, recovering once from a lock an interrupted git left.
+ *
+ * The recovery runs only after git reported a lock error, so a live lock is
+ * never touched: `recoverGitLock` refuses to delete it and the caller decides
+ * what to say. A successful second attempt is transparent to the caller.
+ *
+ * @param bin - git executable.
+ * @param cwd - directory that anchors `-C`.
+ * @param args - arguments after `-C <cwd>`.
+ * @param options - optional stdin, timeout, and environment additions.
+ * @returns the git result, plus `lock` when recovery was attempted.
+ */
+async function runGit(bin, cwd, args, options = {}) {
+  const first = await runGitRaw(bin, cwd, args, options);
+  if (first.code === 0 || !LOCK_ERROR_RE.test(first.stderr)) return first;
+  const lock = await recoverGitLock(bin, cwd, { timeoutMs: options.timeoutMs, stderr: first.stderr });
+  if (lock.status === 'held' || lock.status === 'unknown') return { ...first, lock };
+  const retry = await runGitRaw(bin, cwd, args, options);
+  return { ...retry, lock };
+}
+
+/**
+ * Turn a lock probe into one actionable sentence for the dialog.
+ * @param lock - `recoverGitLock`'s result, when recovery was attempted.
+ * @returns an empty string, or a sentence that starts with a space.
+ */
+function lockHint(lock) {
+  if (lock === undefined || lock === null) return '';
+  if (lock.status === 'held') {
+    const pids = lock.pids.join('、');
+    return ` 该仓库正被另一个 git 进程（PID ${pids}）占用，等它结束后再试；不要手动删除 ${lock.path}。`;
+  }
+  if (lock.status === 'unknown') {
+    return ` 无法确认 ${lock.path} 是残留锁还是仍在使用${lock.error ? `（${lock.error}）` : ''}，确认没有 git 进程后手动删除再试。`;
+  }
+  return '';
 }
 
 /**
@@ -657,7 +853,7 @@ async function analyzeGitRepo({ gitBin, cwd, maxGroups, timeoutMs }) {
     { timeoutMs },
   );
   if (status.code !== 0) {
-    return { ok: false, text: `读取 git status 失败：${status.stderr.trim()}` };
+    return { ok: false, text: `读取 git status 失败：${status.stderr.trim()}${lockHint(status.lock)}` };
   }
   const entries = parseStatus(status.stdout);
   if (entries.length === 0) {
@@ -1376,15 +1572,19 @@ async function commitGitPlan(plan, messages, { gitBin, timeoutMs }) {
 
   /** Move this run's own staging back out of the index, keeping the work. */
   const rollback = async (paths, index) => {
-    if (paths.length === 0) return;
+    if (paths.length === 0) return undefined;
     const restore = await runGit(gitBin, plan.cwd, ['restore', '--staged', '--', ...paths], {
       timeoutMs,
     });
+    const hint = lockHint(restore.lock);
     lines.push(
       restore.code === 0
         ? `已把第 ${index + 1} 组移出暂存区，改动仍保留在工作区。`
-        : `⚠ 第 ${index + 1} 组移出暂存区失败，请手动执行 git restore --staged -- <path>：${restore.stderr.trim()}`,
+        : hint !== ''
+          ? `⚠ 第 ${index + 1} 组暂时留在暂存区，改动没有丢失。${hint.trim()}`
+          : `⚠ 第 ${index + 1} 组移出暂存区失败，请手动执行 git restore --staged -- <path>：${restore.stderr.trim()}`,
     );
+    return restore;
   };
 
   for (let index = 0; index < plan.groups.length; index += 1) {
@@ -1410,8 +1610,11 @@ async function commitGitPlan(plan, messages, { gitBin, timeoutMs }) {
     }
     const add = await runGit(gitBin, plan.cwd, ['add', '--', ...group.files], { timeoutMs });
     if (add.code !== 0) {
-      await rollback(group.files, index);
-      lines.push(`提交中止：第 ${index + 1} 组暂存失败——${add.stderr.trim()}`);
+      const restored = await rollback(group.files, index);
+      const explained = lockHint(restored?.lock) !== '';
+      lines.push(
+        `提交中止：第 ${index + 1} 组暂存失败——${add.stderr.trim()}${explained ? '' : lockHint(add.lock)}`,
+      );
       break;
     }
     const diff = await runGit(gitBin, plan.cwd, ['diff', '--cached', '--quiet'], { timeoutMs });
@@ -1427,6 +1630,7 @@ async function commitGitPlan(plan, messages, { gitBin, timeoutMs }) {
 
     let directory;
     let failure;
+    let lock;
     try {
       directory = await mkdtemp(join(tmpdir(), 'dsh-smart-commit-'));
       const file = join(directory, 'message.txt');
@@ -1434,6 +1638,7 @@ async function commitGitPlan(plan, messages, { gitBin, timeoutMs }) {
       const commit = await runGit(gitBin, plan.cwd, ['commit', '-F', file], { timeoutMs });
       if (commit.code !== 0) {
         failure = (commit.stderr || commit.stdout).trim();
+        lock = commit.lock;
       } else {
         const short = await runGit(gitBin, plan.cwd, ['log', '-1', '--format=%h %s'], { timeoutMs });
         const subject = short.stdout.trim();
@@ -1447,8 +1652,9 @@ async function commitGitPlan(plan, messages, { gitBin, timeoutMs }) {
     }
     if (failure !== undefined) {
       // Never leave this run's staging behind: the next click must start clean.
-      await rollback(group.files, index);
-      lines.push(`提交中止：第 ${index + 1} 组提交失败——${failure}`);
+      const restored = await rollback(group.files, index);
+      const explained = lockHint(restored?.lock) !== '';
+      lines.push(`提交中止：第 ${index + 1} 组提交失败——${failure}${explained ? '' : lockHint(lock)}`);
       break;
     }
   }
@@ -1456,6 +1662,9 @@ async function commitGitPlan(plan, messages, { gitBin, timeoutMs }) {
   const left = await runGit(gitBin, plan.cwd, ['-c', 'core.quotepath=false', 'status', '--porcelain'], {
     timeoutMs,
   });
+  if (left.code !== 0) {
+    lines.push(`读取剩余改动失败——${left.stderr.trim()}${lockHint(left.lock)}`);
+  }
   const remaining = left.stdout.split('\n').filter((line) => line.trim() !== '');
   return finishOutcome(done, plan.groups.length, remaining, lines);
 }
@@ -2002,7 +2211,11 @@ export function createApi(ctx, config) {
         timeoutMs: config.timeoutMs,
       });
       if (release.code !== 0) {
-        throw new ApiError('staged', `提交中止：取消暂存失败——${release.stderr.trim()}`);
+        const locked = release.lock?.status === 'held' || release.lock?.status === 'unknown';
+        throw new ApiError(
+          locked ? 'locked' : 'staged',
+          `提交中止：取消暂存失败——${release.stderr.trim()}${lockHint(release.lock)}`,
+        );
       }
       fresh.staged = [];
     }
