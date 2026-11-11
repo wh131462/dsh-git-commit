@@ -67,6 +67,7 @@ Or from the Web sidebar: **Plugins → Add plugin** and paste the same spec. The
 - DeepSeek Harness with the standard host services (`webServer`, `connection`, `sessions`, `workingDirectory`, `llm`, `agentDefaultModel`) and client slots.
 - `git` and/or `svn` on `PATH`; the plugin also probes `/usr/bin/git`, `/opt/homebrew/bin/git`, `/usr/local/bin/git`, `/usr/bin/svn`, `/opt/homebrew/bin/svn`, and `/usr/local/bin/svn`, so a Finder-launched app works.
 - A usable model route for semantic messages. Set `useModel: false` to skip the model and write every message by hand.
+- A GitHub install also needs Node 20+ and pnpm on the machine: the install runs `prepare` to build `lib/`. The npm tarball is prebuilt and needs no toolchain.
 
 ## Usage
 
@@ -189,19 +190,31 @@ Every git call that meets an `index.lock` first checks whether a process still h
 ```bash
 git clone git@github.com:wh131462/dsh-git-commit.git
 cd dsh-git-commit
-npm test          # node --test, no third-party dependencies
+pnpm install       # devDependencies + one prepare build
+pnpm run typecheck # tsc --noEmit
+pnpm run lint      # Biome
+pnpm test          # node:test + tsx, real temporary git / svn repositories
+pnpm run build     # emits lib/index.js and lib/client.js
 ```
 
 ```text
-index.js          host half: JSON channel, probe dispatch, grouping, model call, validation, commit
-svn.js            SVN adapter: info/status probes, add, commit, revert, diff
-client.js         client half: button, phased confirmation dialog, progress and errors
-cordis.patch.yml  the loader row this bundle inserts
-locale/           plugin metadata (en, zh)
-test/             host and route tests with real temporary git / svn repositories
+src/host/          host ESM: JSON channel, probe dispatch, grouping, model call, validation, commit
+src/host/svn.ts    SVN adapter: info/status probes, add, commit, revert, diff
+src/client/        client: store, controller, i18n, React confirmation dialog
+src/shared/        API v5 wire contract shared by both halves
+lib/               build artifacts (the npm package): host ESM + client ModuleLoader CJS
+cordis.patch.yml   the loader row this bundle inserts
+locale/            plugin metadata (en, zh)
+test/              host, route, and client store / UI tests
 ```
 
-The bundle has no runtime dependencies: the host half uses Node built-ins, and the client half gets React from the Harness module table. The tests create real temporary repositories and drive a stub LLM, covering grouping, consolidation without path loss, validation, repair rounds, blocked groups, index release, failed-commit rollback, orphaned-lock recovery and live-lock refusal, stale-plan refusal, and the channel's auth, method, and JSON checks; with `svn`/`svnadmin` installed they also run real SVN checkouts, revisions, sensitive-file skipping, add rollback, and non-ASCII paths under the plugin's UTF-8 locale.
+The sources are TypeScript: the host is checked with `tsc --noEmit`, and `dsh-build-tools` + `esbuild` emit both the host ESM half and the client's `window.__ModuleLoader__` CJS wrapper. `react` / `react/jsx-runtime` / `@deepseek-ai/*` stay external on the client. **Runtime dependencies are still zero**: every tool is a devDependency and the published tarball only carries `lib/`.
+
+The tests create real temporary repositories and drive a stub LLM, covering grouping, consolidation without path loss, validation, repair rounds, blocked groups, index release, failed-commit rollback, orphaned-lock recovery and live-lock refusal, stale-plan refusal, and the channel's auth, method, and JSON checks; with `svn`/`svnadmin` installed they also run real SVN checkouts, revisions, sensitive-file skipping, add rollback, and non-ASCII paths under the plugin's UTF-8 locale. Client regrouping is a pure store covered directly by Node tests.
+
+## Upgrading from 2.1.0
+
+2.2.0 moves the sources to TypeScript and publishes dual-face build output: the npm tarball ships prebuilt `lib/index.js` and `lib/client.js`, so installation is unchanged. A GitHub install runs `prepare`, so it needs Node 20+ and pnpm on the machine; configuration, the HTTP channel, and API v5 are unchanged. Restart DSH after upgrading.
 
 ## Contributing
 

@@ -67,6 +67,7 @@ plugin_manager install_bundle  target: "/absolute/path/eternalheart-dsh-git-comm
 - DeepSeek Harness，且具备标准 Host 服务（`webServer`、`connection`、`sessions`、`workingDirectory`、`llm`、`agentDefaultModel`）与客户端 slots。
 - `PATH` 里有 `git` 和/或 `svn`；插件也会探测 `/usr/bin/git`、`/opt/homebrew/bin/git`、`/usr/local/bin/git`、`/usr/bin/svn`、`/opt/homebrew/bin/svn`、`/usr/local/bin/svn`，所以从 Finder 启动的 App 也能用。
 - 可用的模型路由；把 `useModel` 设为 `false` 可以不开模型、全部手写 message。
+- 从 GitHub 安装时，本机还需要 Node 20+ 与 pnpm：安装阶段会执行 `prepare` 构建 `lib/`。npm tarball 已预构建，不需要工具链。
 
 ## 使用
 
@@ -181,19 +182,31 @@ Host 不接受模型说了算的部分：每个编号必须恰好被用到一次
 ```bash
 git clone git@github.com:wh131462/dsh-git-commit.git
 cd dsh-git-commit
-npm test          # node --test，无第三方依赖
+pnpm install       # 安装 devDependencies，并跑一次 prepare 构建
+pnpm run typecheck # tsc --noEmit
+pnpm run lint      # Biome
+pnpm test          # node:test + tsx，真实临时 git / svn 仓库
+pnpm run build     # 生成 lib/index.js 与 lib/client.js
 ```
 
 ```text
-index.js          Host：JSON 通道、探测分发、分组、模型调用、校验、提交
-svn.js            SVN 适配器：info/status 探测、add、commit、revert、diff
-client.js         Client：按钮、阶段化确认弹窗、进度与错误提示
+src/host/          Host ESM：JSON 通道、探测分发、分组、模型调用、校验、提交
+src/host/svn.ts    SVN 适配器：info/status 探测、add、commit、revert、diff
+src/client/        Client：store、controller、i18n、React 确认弹窗
+src/shared/        API v5 线协议，Host 与 Client 共用的类型
+lib/               构建产物（npm 包内容），Host ESM + Client ModuleLoader CJS
 cordis.patch.yml  这个 bundle 插入的 Loader 行
 locale/           插件元数据（en、zh）
-test/             使用真实临时 git / svn 仓库的 Host 与路由测试
+test/             Host、路由与 Client store / UI 测试
 ```
 
-插件没有运行时依赖：Host 只用 Node 内置模块，Client 的 React 来自 Harness 的模块表。测试会创建真实临时仓库并驱动一个 stub LLM，覆盖分组、不丢路径、不设组数上限、校验、修复轮、留空阻断、暂存释放、失败回滚、残留 `index.lock` 恢复与活锁保护、工作区变化拦截，以及通道的鉴权、方法和 JSON 校验；安装 `svn`/`svnadmin` 时还会跑真实工作副本、revision、敏感文件跳过、add 回滚，以及在插件 UTF-8 locale 下的非 ASCII 路径提交。
+源码是 TypeScript：Host 用 `tsc --noEmit` 做类型检查，构建用 `dsh-build-tools` + `esbuild` 同时产出 Host ESM 和 Client 的 `window.__ModuleLoader__` CJS 包装；`react` / `react/jsx-runtime` / `@deepseek-ai/*` 在 Client 侧保持 external。**运行时依赖仍然是零**：所有工具都在 devDependencies 里，npm 包只带 `lib/`。
+
+测试会创建真实临时仓库并驱动一个 stub LLM，覆盖分组、不丢路径、不设组数上限、校验、修复轮、留空阻断、暂存释放、失败回滚、残留 `index.lock` 恢复与活锁保护、工作区变化拦截，以及通道的鉴权、方法和 JSON 校验；安装 `svn`/`svnadmin` 时还会跑真实工作副本、revision、敏感文件跳过、add 回滚，以及在插件 UTF-8 locale 下的非 ASCII 路径提交。Client 的分组操作已经抽成纯 store，直接由 Node 测试覆盖。
+
+## 从 2.1.0 升级
+
+2.2.0 把源码迁到 TypeScript，并改为双端构建后发布：npm 包里的 `lib/index.js`、`lib/client.js` 是预构建产物，安装方式不变。从 GitHub 安装的 profile 会在安装时执行 `prepare`，需要本机有 Node 20+ 和 pnpm；配置项、HTTP 通道和 API v5 都没有变化。升级后重启 DSH 即可。
 
 ## 从 2.0.3 升级
 
