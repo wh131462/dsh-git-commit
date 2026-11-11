@@ -1,40 +1,43 @@
-import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn, execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
+import test from 'node:test';
 import { promisify } from 'node:util';
-
 import {
-  analyzeRepo,
-  apply,
-  applyModelGroups,
   assertPlanMatches,
-  buildGroupingInput,
-  buildUnitGroupingInput,
-  expandUnitGroups,
-  buildHeader,
-  buildModelInput,
-  classify,
-  commitPlan,
   createApi,
   createRouteHandler,
+  planFromSubmitted,
+  publicPlan,
+} from '../src/host/api.ts';
+import { commitPlan } from '../src/host/commit.ts';
+import { resolveConfig } from '../src/host/config.ts';
+import { apply } from '../src/host/index.ts';
+import {
+  applyModelGroups,
+  buildGroupingInput,
+  buildModelInput,
+  buildUnitGroupingInput,
+  expandUnitGroups,
   extractGroupPlan,
   extractMessages,
+} from '../src/host/model.ts';
+import {
+  buildHeader,
+  classify,
   groupEntries,
   isSensitive,
   normalizeMessage,
   parseStatus,
-  planFromSubmitted,
-  publicPlan,
-  recoverGitLock,
-  resolveConfig,
   scopeOf,
   validateMessage,
-} from '../index.js';
+} from '../src/host/plan.ts';
+import { recoverGitLock } from '../src/host/process.ts';
+import { analyzeRepo } from '../src/host/repo.ts';
 
 const exec = promisify(execFile);
 const GIT = 'git';
@@ -73,7 +76,7 @@ async function populate(dir) {
   await writeFile(join(dir, '.github', 'workflows', 'ci.yml'), 'name: ci\n', 'utf8');
   await writeFile(
     join(dir, 'package.json'),
-    JSON.stringify({ name: 'fixture', version: '1.0.0' }, null, 2) + '\n',
+    `${JSON.stringify({ name: 'fixture', version: '1.0.0' }, null, 2)}\n`,
     'utf8',
   );
   await writeFile(join(dir, '.env'), 'SECRET=1\n', 'utf8');
@@ -92,7 +95,11 @@ function makeCtx(cwd, { sessionId = SESSION, llm = autoLlm(), admit } = {}) {
       {
         header: { cwd },
         requestHeader: () => ({
-          config: { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' },
+          config: {
+            provider: 'deepseek-official',
+            model: 'deepseek-flash',
+            reasoningEffort: 'high',
+          },
         }),
       },
     ],
@@ -140,7 +147,10 @@ function fakeLlm(reply, { fail = false } = {}) {
       if (fail) {
         yield {
           type: 'finish',
-          reason: { kind: 'error', failure: { message: 'DeepSeek Messages transport failed', code: 'TRANSPORT' } },
+          reason: {
+            kind: 'error',
+            failure: { message: 'DeepSeek Messages transport failed', code: 'TRANSPORT' },
+          },
         };
         return;
       }
@@ -212,7 +222,12 @@ function autoLlm() {
 }
 
 /** One fake request stream for the route handler. */
-function fakeRequest({ method = 'POST', url = '/dsh-git-commit/analyze', body = {}, contentType = 'application/json' }) {
+function fakeRequest({
+  method = 'POST',
+  url = '/dsh-git-commit/analyze',
+  body = {},
+  contentType = 'application/json',
+}) {
   const request = Readable.from([Buffer.from(JSON.stringify(body))]);
   request.method = method;
   request.url = url;
@@ -313,14 +328,22 @@ test('validates the Angular message rules', () => {
   assert.equal(validateMessage('chore: 杂务'), 'type 不在枚举内：chore');
   assert.equal(validateMessage('fix: 句号。'), 'subject 结尾不要标点');
   assert.equal(validateMessage('fix: 首字母大写'), null);
-  assert.equal(validateMessage('fix(Auth): 大小写 scope'), 'header 不符合 <type>(<scope>): <subject>');
-  assert.equal(validateMessage('fix: 空行缺失\nbody'), 'header 与 body 之间必须空一行');
-  assert.equal(validateMessage('feat!: 重写接口'), 'header 用 ! 标记破坏性变更时，body 需写 BREAKING CHANGE: 说明');
   assert.equal(
-    validateMessage('feat!: 重写接口\n\nBREAKING CHANGE: 调用方需补齐参数'),
+    validateMessage('fix(Auth): 大小写 scope'),
+    'header 不符合 <type>(<scope>): <subject>',
+  );
+  assert.equal(validateMessage('fix: 空行缺失\nbody'), 'header 与 body 之间必须空一行');
+  assert.equal(
+    validateMessage('feat!: 重写接口'),
+    'header 用 ! 标记破坏性变更时，body 需写 BREAKING CHANGE: 说明',
+  );
+  assert.equal(validateMessage('feat!: 重写接口\n\nBREAKING CHANGE: 调用方需补齐参数'), null);
+  assert.equal(
+    validateMessage(
+      buildHeader('refactor', 'backend-coal-mind-agent', '更新 一个非常长的文件名.ts'),
+    ),
     null,
   );
-  assert.equal(validateMessage(buildHeader('refactor', 'backend-coal-mind-agent', '更新 一个非常长的文件名.ts')), null);
 });
 
 test('rejects subjects that only report a count or a bare scope', () => {
@@ -467,55 +490,57 @@ test('clears the exact lock path git reported, not just the index', async () => 
   }
 });
 
-test(
-  'keeps a lock that a live process holds and names the holder',
-  { skip: process.platform === 'win32' },
-  async () => {
-    const repo = await createRepo();
-    const lock = join(repo.dir, '.git', 'index.lock');
-    let holder;
-    try {
-      await populate(repo.dir);
-      await writeFile(lock, '', 'utf8');
-      holder = spawn(
-        process.execPath,
-        ['-e', "require('node:fs').openSync(process.argv[1], 'r'); setInterval(() => {}, 1000);", lock],
-        { stdio: 'ignore' },
-      );
+test('keeps a lock that a live process holds and names the holder', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const repo = await createRepo();
+  const lock = join(repo.dir, '.git', 'index.lock');
+  let holder;
+  try {
+    await populate(repo.dir);
+    await writeFile(lock, '', 'utf8');
+    holder = spawn(
+      process.execPath,
+      [
+        '-e',
+        "require('node:fs').openSync(process.argv[1], 'r'); setInterval(() => {}, 1000);",
+        lock,
+      ],
+      { stdio: 'ignore' },
+    );
 
-      // Wait for the descriptor to be observable: lsof on macOS, /proc on Linux.
-      let probe = { status: 'none', pids: [] };
-      for (let attempt = 0; attempt < 60; attempt += 1) {
-        probe = await recoverGitLock(GIT, repo.dir, { timeoutMs: 20000 });
-        if (probe.status === 'held') break;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-      assert.equal(probe.status, 'held', JSON.stringify(probe));
-      assert.deepEqual(probe.pids, [holder.pid]);
-      assert.equal(existsSync(lock), true, 'a live lock must never be deleted');
-
-      const analysis = await analyzeRepo({
-        gitBin: GIT,
-        cwd: repo.dir,
-        timeoutMs: 20000,
-      });
-      const pid = `PID ${holder.pid}`;
-      if (analysis.ok) {
-        const messages = analysis.plan.groups.map((group) => group.message);
-        const outcome = await commitPlan(analysis.plan, messages, { gitBin: GIT, timeoutMs: 20000 });
-        assert.equal(outcome.ok, false);
-        assert.match(outcome.text, new RegExp(pid));
-      } else {
-        // `git status` may already need the index; its message must name the holder too.
-        assert.match(analysis.text, new RegExp(pid));
-      }
-      assert.equal(existsSync(lock), true, 'the commit must leave the live lock alone');
-    } finally {
-      holder?.kill('SIGKILL');
-      await repo.cleanup();
+    // Wait for the descriptor to be observable: lsof on macOS, /proc on Linux.
+    let probe = { status: 'none', pids: [] };
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      probe = await recoverGitLock(GIT, repo.dir, { timeoutMs: 20000 });
+      if (probe.status === 'held') break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
-  },
-);
+    assert.equal(probe.status, 'held', JSON.stringify(probe));
+    assert.deepEqual(probe.pids, [holder.pid]);
+    assert.equal(existsSync(lock), true, 'a live lock must never be deleted');
+
+    const analysis = await analyzeRepo({
+      gitBin: GIT,
+      cwd: repo.dir,
+      timeoutMs: 20000,
+    });
+    const pid = `PID ${holder.pid}`;
+    if (analysis.ok) {
+      const messages = analysis.plan.groups.map((group) => group.message);
+      const outcome = await commitPlan(analysis.plan, messages, { gitBin: GIT, timeoutMs: 20000 });
+      assert.equal(outcome.ok, false);
+      assert.match(outcome.text, new RegExp(pid));
+    } else {
+      // `git status` may already need the index; its message must name the holder too.
+      assert.match(analysis.text, new RegExp(pid));
+    }
+    assert.equal(existsSync(lock), true, 'the commit must leave the live lock alone');
+  } finally {
+    holder?.kill('SIGKILL');
+    await repo.cleanup();
+  }
+});
 
 test('refuses to commit when the index already holds content', async () => {
   const repo = await createRepo();
@@ -768,7 +793,8 @@ test('api.name reports a model transport failure without touching git', async ()
     const { api } = makeApi(repo.dir, { llm: fakeLlm('', { fail: true }) });
     await assert.rejects(
       api.name({ sessionId: SESSION }),
-      (error) => error.code === 'model-failed' && /DeepSeek Messages transport failed/.test(error.message),
+      (error) =>
+        error.code === 'model-failed' && /DeepSeek Messages transport failed/.test(error.message),
     );
     const log = await exec(GIT, ['log', '--format=%s'], { cwd: repo.dir });
     assert.equal(log.stdout.trim(), 'docs: 初始化 README');
@@ -906,7 +932,9 @@ test('commits the model grouping instead of the rule preview', async () => {
     assert.match(outcome.text, /提交完成：5 组/);
 
     // The merged group is one commit that holds all three paths.
-    const first = await exec(GIT, ['show', '--name-only', '--format=%s', 'HEAD~4'], { cwd: repo.dir });
+    const first = await exec(GIT, ['show', '--name-only', '--format=%s', 'HEAD~4'], {
+      cwd: repo.dir,
+    });
     assert.match(first.stdout, /^feat: 新增接口与工具模块/m);
     for (const file of ['api/handler.js', 'src/app.js', 'src/util.js']) {
       assert.ok(first.stdout.includes(file), file);
@@ -1026,7 +1054,10 @@ test('unit input numbers rule buckets and expands back to files', async () => {
       [{ units: [1, 2], type: 'refactor', scope: '', message: 'refactor: 合并前两个单元' }],
       built.units,
     );
-    assert.equal(expanded[0].files.length, built.units[0].files.length + built.units[1].files.length);
+    assert.equal(
+      expanded[0].files.length,
+      built.units[0].files.length + built.units[1].files.length,
+    );
     // Out-of-range unit numbers are dropped, never expanded into other files.
     const bounded = expandUnitGroups([{ units: [1, 99], message: '' }], built.units);
     assert.deepEqual(bounded[0].files, built.units[0].files);
@@ -1156,7 +1187,8 @@ test('keeps every model group, no matter how many', () => {
     applied.groups.flatMap((group) => group.files).sort(),
     entries.map((entry) => entry.path).sort(),
   );
-  for (const group of applied.groups) assert.equal(validateMessage(group.message), null, group.message);
+  for (const group of applied.groups)
+    assert.equal(validateMessage(group.message), null, group.message);
 });
 
 test('name keeps more than a dozen model groups', async () => {
@@ -1165,7 +1197,11 @@ test('name keeps more than a dozen model groups', async () => {
     const groups = [];
     for (let index = 0; index < 15; index += 1) {
       await mkdir(join(repo.dir, `pkg${index}`), { recursive: true });
-      await writeFile(join(repo.dir, `pkg${index}`, 'index.js'), `export const n = ${index};\n`, 'utf8');
+      await writeFile(
+        join(repo.dir, `pkg${index}`, 'index.js'),
+        `export const n = ${index};\n`,
+        'utf8',
+      );
       groups.push({
         paths: [`pkg${index}/index.js`],
         type: 'feat',
@@ -1210,7 +1246,10 @@ test('planFromSubmitted rejects duplicates, missing paths, and empty groups', as
     const plan = publicPlan(analysis.plan);
 
     const duplicated = { ...plan, groups: [...plan.groups, { ...plan.groups[0] }] };
-    assert.throws(() => planFromSubmitted(duplicated, analysis.plan), (error) => error.code === 'stale');
+    assert.throws(
+      () => planFromSubmitted(duplicated, analysis.plan),
+      (error) => error.code === 'stale',
+    );
 
     const missing = {
       ...plan,
@@ -1220,8 +1259,14 @@ test('planFromSubmitted rejects duplicates, missing paths, and empty groups', as
         )
         .filter((group) => group.files.length > 0),
     };
-    assert.throws(() => planFromSubmitted(missing, analysis.plan), (error) => error.code === 'stale');
-    assert.throws(() => planFromSubmitted({ ...plan, groups: [] }, analysis.plan), (error) => error.code === 'stale');
+    assert.throws(
+      () => planFromSubmitted(missing, analysis.plan),
+      (error) => error.code === 'stale',
+    );
+    assert.throws(
+      () => planFromSubmitted({ ...plan, groups: [] }, analysis.plan),
+      (error) => error.code === 'stale',
+    );
 
     // The rule preview covers the tree, so it is still a valid submission.
     assert.equal(planFromSubmitted(plan, analysis.plan).length, plan.groups.length);
@@ -1251,7 +1296,10 @@ test('assertPlanMatches accepts edited messages and rejects a changed grouping',
     await populate(repo.dir);
     const analysis = await analyzeRepo({ gitBin: GIT, cwd: repo.dir, timeoutMs: 20000 });
     const plan = publicPlan(analysis.plan);
-    const edited = { ...plan, groups: plan.groups.map((group) => ({ ...group, message: 'docs: 改过' })) };
+    const edited = {
+      ...plan,
+      groups: plan.groups.map((group) => ({ ...group, message: 'docs: 改过' })),
+    };
     assert.doesNotThrow(() => assertPlanMatches(edited, analysis.plan));
     const moved = {
       ...plan,
@@ -1259,7 +1307,10 @@ test('assertPlanMatches accepts edited messages and rejects a changed grouping',
         index === 0 ? { ...group, files: [...group.files, 'src/extra.js'] } : group,
       ),
     };
-    assert.throws(() => assertPlanMatches(moved, analysis.plan), (error) => error.code === 'stale');
+    assert.throws(
+      () => assertPlanMatches(moved, analysis.plan),
+      (error) => error.code === 'stale',
+    );
   } finally {
     await repo.cleanup();
   }
@@ -1413,7 +1464,10 @@ test('grouping input numbers every path, carries diff text, and honors the budge
     assert.match(input, /新文件 src\/app\.js/);
 
     // The numbering is the contract; when it cannot fit, the rules stay.
-    assert.equal(await buildGroupingInput(GIT, analysis.plan, { budget: 200, timeoutMs: 20000 }), null);
+    assert.equal(
+      await buildGroupingInput(GIT, analysis.plan, { budget: 200, timeoutMs: 20000 }),
+      null,
+    );
     const bounded = await buildGroupingInput(GIT, analysis.plan, {
       budget: 1500,
       timeoutMs: 20000,
@@ -1421,7 +1475,10 @@ test('grouping input numbers every path, carries diff text, and honors the budge
     assert.ok(bounded.length < 1800, `bounded input was ${bounded.length} chars`);
 
     // The repair prompt still describes each group it is asked to rename.
-    const repairInput = await buildModelInput(GIT, analysis.plan, { budget: 100000, timeoutMs: 20000 });
+    const repairInput = await buildModelInput(GIT, analysis.plan, {
+      budget: 100000,
+      timeoutMs: 20000,
+    });
     assert.match(repairInput, /共 5 组改动/);
   } finally {
     await repo.cleanup();

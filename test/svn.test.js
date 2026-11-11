@@ -1,21 +1,17 @@
-import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, spawnSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile, readFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-
-import {
-  analyzeRepo,
-  buildModelInput,
-  classify,
-  commitPlan,
-  createApi,
-  publicPlan,
-  resolveConfig,
-} from '../index.js';
+import { createApi, publicPlan } from '../src/host/api.ts';
+import { commitPlan } from '../src/host/commit.ts';
+import { resolveConfig } from '../src/host/config.ts';
+import { buildModelInput } from '../src/host/model.ts';
+import { classify } from '../src/host/plan.ts';
+import { analyzeRepo } from '../src/host/repo.ts';
 import {
   parseAddOutput,
   parseSvnInfoXml,
@@ -23,7 +19,7 @@ import {
   svnCommitGroup,
   svnEnv,
   svnStatus,
-} from '../svn.js';
+} from '../src/host/svn.ts';
 
 const exec = promisify(execFile);
 const SVN_ENV = svnEnv();
@@ -156,10 +152,15 @@ test('parses svn status xml, including escaping and property changes', () => {
 
 test('parses svn add output, including paths with spaces', () => {
   assert.deepEqual(
-    parseAddOutput(`A         pkg\nA         pkg/deep\nA         pkg/deep/new.js\nA         ${ODD_PATH}\n`),
+    parseAddOutput(
+      `A         pkg\nA         pkg/deep\nA         pkg/deep/new.js\nA         ${ODD_PATH}\n`,
+    ),
     ['pkg', 'pkg/deep', 'pkg/deep/new.js', ODD_PATH],
   );
-  assert.deepEqual(parseAddOutput("svn: warning: W150002: 'x' is already under version control\n"), []);
+  assert.deepEqual(
+    parseAddOutput("svn: warning: W150002: 'x' is already under version control\n"),
+    [],
+  );
 });
 
 test('keeps the VCS marker in the wire plan', () => {
@@ -170,7 +171,14 @@ test('keeps the VCS marker in the wire plan', () => {
     staged: [],
     skipped: ['.env'],
     warnings: ['工作区条目被同名文件阻碍，已跳过：x'],
-    groups: [{ type: 'feat', scope: 'pkg', message: 'feat(pkg): 新增文件', files: ['pkg/a.js', 'pkg/b.js'] }],
+    groups: [
+      {
+        type: 'feat',
+        scope: 'pkg',
+        message: 'feat(pkg): 新增文件',
+        files: ['pkg/a.js', 'pkg/b.js'],
+      },
+    ],
   });
   assert.equal(plan.vcs, 'svn');
   assert.equal(plan.branch, 'trunk');
@@ -250,7 +258,8 @@ test('sends a pinned SVN adapter through the API', { skip: !HAS_SVN }, async () 
     };
     const ctx = {
       get(name) {
-        if (name === 'sessions') return { get: (id) => (id === 'svn-session' ? session : undefined) };
+        if (name === 'sessions')
+          return { get: (id) => (id === 'svn-session' ? session : undefined) };
         if (name === 'workingDirectory') return { get: (value) => value.header.cwd };
         if (name === 'llm') return autoLlm();
         return undefined;
@@ -328,7 +337,10 @@ test('unschedules only its own added paths when a commit fails', { skip: !HAS_SV
       status.entries.map((entry) => entry.code),
       ['??'],
     );
-    assert.equal(await readFile(join(repo.wc, 'new', 'deep', 'n.js'), 'utf8'), 'export const n = 1;\n');
+    assert.equal(
+      await readFile(join(repo.wc, 'new', 'deep', 'n.js'), 'utf8'),
+      'export const n = 1;\n',
+    );
   } finally {
     await repo.cleanup();
   }
