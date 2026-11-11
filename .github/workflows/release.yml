@@ -46,11 +46,22 @@ jobs:
             echo "Expected subject: feat: vX.Y.Z — skipping."
           fi
 
+      - name: Set up pnpm
+        if: steps.detect.outputs.matched == 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
       - name: Set up Node.js
         if: steps.detect.outputs.matched == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        if: steps.detect.outputs.matched == 'true'
+        run: pnpm install --frozen-lockfile
 
       - name: Pin package version
         if: steps.detect.outputs.matched == 'true'
@@ -60,9 +71,17 @@ jobs:
           npm pkg set version="$VERSION"
           test "$(node -p "require('./package.json').version")" = "$VERSION"
 
+      - name: Typecheck
+        if: steps.detect.outputs.matched == 'true'
+        run: pnpm run typecheck
+
+      - name: Lint
+        if: steps.detect.outputs.matched == 'true'
+        run: pnpm run lint
+
       - name: Test
         if: steps.detect.outputs.matched == 'true'
-        run: npm test
+        run: pnpm test
 
       - name: Generate release notes
         if: steps.detect.outputs.matched == 'true'
@@ -74,10 +93,14 @@ jobs:
             --output RELEASE_NOTES.md
           cat RELEASE_NOTES.md
 
+      - name: Build
+        if: steps.detect.outputs.matched == 'true'
+        run: pnpm run build
+
       - name: Pack tarball
         if: steps.detect.outputs.matched == 'true'
         run: |
-          npm pack --json > pack.json
+          npm pack --json --ignore-scripts > pack.json
           TARBALL="$(node -p "JSON.parse(require('fs').readFileSync('pack.json', 'utf8'))[0].filename")"
           echo "TARBALL=${TARBALL}" >> "$GITHUB_ENV"
           echo "Packed ${TARBALL}"
