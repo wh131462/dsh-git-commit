@@ -65,7 +65,7 @@ function repositoryUrl() {
   if (process.env.GITHUB_REPOSITORY) {
     return `https://github.com/${process.env.GITHUB_REPOSITORY}`;
   }
-  const raw = typeof PKG.repository === 'string' ? PKG.repository : PKG.repository?.url ?? '';
+  const raw = typeof PKG.repository === 'string' ? PKG.repository : (PKG.repository?.url ?? '');
   return raw
     .replace(/^git\+/, '')
     .replace(/^git@github\.com:/, 'https://github.com/')
@@ -115,7 +115,9 @@ function groupCommits(commits) {
     groups.get(label).push(commit);
   }
   const order = [BREAKING_LABEL, ...TYPE_LABELS.values(), OTHER_LABEL];
-  return [...groups.entries()].sort(([left], [right]) => order.indexOf(left) - order.indexOf(right));
+  return [...groups.entries()].sort(
+    ([left], [right]) => order.indexOf(left) - order.indexOf(right),
+  );
 }
 
 function renderNotes({ version, tag, repoUrl, from, commits }) {
@@ -127,7 +129,9 @@ function renderNotes({ version, tag, repoUrl, from, commits }) {
     for (const [label, items] of groupCommits(commits)) {
       lines.push(`### ${label}`, '');
       for (const commit of items) {
-        const text = commit.scope ? `**${commit.scope}**: ${commit.description}` : commit.description;
+        const text = commit.scope
+          ? `**${commit.scope}**: ${commit.description}`
+          : commit.description;
         const link = `${repoUrl}/commit/${commit.sha}`;
         lines.push(`- ${text} ([${commit.short}](${link}))`);
       }
